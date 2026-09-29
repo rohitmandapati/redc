@@ -1,0 +1,5 @@
+// Simple adder for 8-bit integers
+
+uint8 add(uint8 a, uint8 b) {
+    return a + b;
+}
