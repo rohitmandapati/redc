@@ -1,17 +1,39 @@
-start: function
+start: top_level+
 
-function: type NAME "(" parameters ")" "{" return_statement "}"
+?top_level: const_decl | function
 
+const_decl: "const" type NAME "=" expr ";"
+
+function: type NAME "(" parameters? ")" block
 parameters: parameter ("," parameter)*
 parameter: type NAME
 
-return_statement: "return" expr ";"
+block: "{" statement* "}"
 
-?expr: expr "+" atom -> add
-     | atom
+?statement: var_decl
+          | assignment
+          | for_stmt
+          | return_stmt
 
-?atom: NAME         -> variable
-     | INT          -> integer
+var_decl: type NAME "=" expr ";"
+assignment: NAME "=" expr ";"
+return_stmt: "return" expr ";"
+
+for_stmt: "for" "(" for_init ";" expr ";" assignment_expr ")" block
+?for_init: var_init | assignment_expr
+var_init: type NAME "=" expr
+assignment_expr: NAME "=" expr
+
+?expr: comparison
+
+?comparison: sum "<" sum -> less_than
+           | sum
+
+?sum: sum "+" atom -> add
+    | atom
+
+?atom: INT          -> integer
+     | NAME         -> variable
      | "(" expr ")"
 
 type: "uint8" -> uint8_type

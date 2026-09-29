@@ -1,12 +1,12 @@
 // Simple n-th fibonnaci number
 
-const uint8 n1 = 1
-const uint8 n2 = 1
+const uint8 n1 = 1;
+const uint8 n2 = 1;
 
 uint8 fib(uint8 n) { // n > 1
     uint8 last1 = n1;
     uint8 last2 = n2;
-    for(i = 1; i < n; n = n + 1) {
+    for(uint8 i = 2; i < n; i = i + 1) {
         uint8 temp_last1 = last1;
         last1 = last2;
         last2 = last1 + temp_last1;
