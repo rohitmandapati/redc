@@ -1,0 +1,95 @@
+// RedC v0.1
+
+start: top_level+
+?top_level: function | declaration ";" -> global_decl
+function: TYPE NAME "(" parameters? ")" block
+parameters: parameter ("," parameter)*
+parameter: TYPE NAME array_size?
+array_size: "[" expr "]"
+block: "{" statement* "}"
+?statement: declaration ";" -> decl_stmt
+          | assignment ";"
+          | update ";"
+          | if_stmt | for_stmt | while_stmt | do_stmt | switch_stmt
+          | "return" expr? ";" -> return_stmt
+          | "break" ";" -> break_stmt
+          | "continue" ";" -> continue_stmt
+          | expr ";" -> expr_stmt
+          | block
+          | ";" -> empty_stmt
+
+declaration: CONST? TYPE NAME array_size? initializer?
+initializer: "=" init_value
+?init_value: expr | "{" [expr ("," expr)* [","]] "}" -> array_init
+assignment: lvalue ASSIGN expr
+?lvalue: NAME -> variable
+       | NAME "[" expr "]" -> index
+update: lvalue UPDATE -> post_update
+      | UPDATE lvalue -> pre_update
+if_stmt: "if" "(" expr ")" statement ("else" statement)?
+for_stmt: "for" "(" for_init ";" for_cond ";" for_step ")" statement
+for_init: (declaration | assignment | update)?
+for_cond: expr?
+for_step: (assignment | update)?
+while_stmt: "while" "(" expr ")" statement
+do_stmt: "do" statement "while" "(" expr ")" ";"
+switch_stmt: "switch" "(" expr ")" "{" switch_arm* "}"
+switch_arm: "case" expr ":" statement* -> case_arm
+          | "default" ":" statement* -> default_arm
+
+?expr: ternary
+?ternary: logical_or "?" expr ":" ternary -> ternary
+        | logical_or
+?logical_or: logical_or OR logical_and -> binary
+           | logical_and
+?logical_and: logical_and AND bit_or -> binary
+            | bit_or
+?bit_or: bit_or BOR bit_xor -> binary
+       | bit_xor
+?bit_xor: bit_xor BXOR bit_and -> binary
+        | bit_and
+?bit_and: bit_and BAND equality -> binary
+        | equality
+?equality: equality EQ comparison -> binary
+         | comparison
+?comparison: comparison CMP shift -> binary
+           | shift
+?shift: shift SHIFT sum -> binary
+      | sum
+?sum: sum ADD product -> binary
+    | product
+?product: product MUL unary -> binary
+        | unary
+?unary: UNARY unary -> unary
+      | "(" TYPE ")" unary -> cast
+      | atom
+?atom: INTEGER -> integer
+     | "true" -> true_value
+     | "false" -> false_value
+     | NAME "(" arguments? ")" -> call
+     | NAME "[" expr "]" -> index
+     | NAME -> variable
+     | "(" expr ")"
+arguments: expr ("," expr)*
+
+CONST: "const"
+TYPE.2: /(?:u?int(?:[1-9][0-9]*)?|bool|void)(?![a-zA-Z0-9_])/
+NAME: /(?!(?:u?int(?:[1-9][0-9]*)?|bool|void)\b)(?!if\b|else\b|for\b|while\b|do\b|switch\b|case\b|default\b|return\b|break\b|continue\b|const\b|true\b|false\b|static\b|volatile\b|extern\b|struct\b|typedef\b|sizeof\b)[a-zA-Z_][a-zA-Z0-9_]*/
+INTEGER: /0[xX][0-9a-fA-F]+|0[bB][01]+|[0-9]+/
+ASSIGN.4: /<<=|>>=|[+*\/%&|^\-]=|=(?!=)/
+UPDATE.3: "++" | "--"
+OR.3: "||"
+AND.3: "&&"
+BOR.3: "|"
+BXOR.3: "^"
+BAND.3: "&"
+EQ.3: "==" | "!="
+CMP: "<=" | ">=" | "<" | ">"
+SHIFT.3: "<<" | ">>"
+ADD: "+" | "-"
+MUL: "*" | "/" | "%"
+UNARY: "!" | "~" | "+" | "-"
+%import common.WS
+%ignore WS
+%ignore /\/\/[^\n]*/
+%ignore /(?s:\/\*.*?\*\/)/
