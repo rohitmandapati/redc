@@ -1,0 +1,7 @@
+uint8 main(uint8 index, uint8 value, bool write) {
+    uint8 table[4] = {10, 20, 30, 40};
+    if (write) {
+        table[index] = value;
+    }
+    return table[index];
+}

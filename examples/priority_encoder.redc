@@ -1,0 +1,8 @@
+uint8 main(uint8 bits) {
+    for (uint8 i = 0; i < 8; ++i) {
+        if ((bits >> i) & 1) {
+            return i;
+        }
+    }
+    return 255;
+}

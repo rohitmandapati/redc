@@ -1,0 +1,16 @@
+// A combinational ALU
+
+uint8 main(uint8 a, uint8 b, uint3 op) {
+    uint8 result = 0;
+    switch (op) {
+        case 0: result = a + b; break;
+        case 1: result = a - b; break;
+        case 2: result = a & b; break;
+        case 3: result = a | b; break;
+        case 4: result = a ^ b; break;
+        case 5: result = a << 1; break;
+        case 6: result = a >> 1; break;
+        default: result = ~a;
+    }
+    return result;
+}

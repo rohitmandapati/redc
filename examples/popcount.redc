@@ -1,0 +1,11 @@
+const uint8 WIDTH = 8;
+uint4 count_bits(uint8 value) {
+    uint4 count = 0;
+    for (uint8 i = 0; i < WIDTH; i++) {
+        count += (uint4)((value >> i) & 1);
+    }
+    return count;
+}
+uint4 main(uint8 value) {
+    return count_bits(value);
+}
