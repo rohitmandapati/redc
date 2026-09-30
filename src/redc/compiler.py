@@ -1,8 +1,16 @@
-"""Elaborate RedC source into a finite combinational graph.
+"""Elaborate RedC source into a hardware graph.
 
-Branches execute on separate environments and merge with mux nodes. Loops run
-at compile time and emit repeated hardware. Function calls inline. Source-level
-assignment only creates a new signal value; it never implies a register.
+Branches execute on separate environments and merge with mux nodes. Function
+calls inline. A loop whose continuation condition is known at compile time is
+unrolled and emits repeated combinational hardware, exactly as before, and
+source-level assignment there only creates a new signal value.
+
+A loop whose bound depends on a runtime value cannot be unrolled, so it is
+lowered instead into a clocked finite state machine: its loop-carried variables
+become registers, one iteration runs per clock tick, and the enclosing function
+gains a ``start``/``done`` handshake. This is what makes stateful programs such
+as the Fibonacci example compile. Sequential lowering is intentionally scoped in
+v1 to a single, unconditional runtime-bounded loop in the top-level function.
 """
 
 from __future__ import annotations
@@ -81,6 +89,11 @@ class Compiler:
         self.steps = 0
         self.true = self.graph.constant(1, BOOL)
         self.false = self.graph.constant(0, BOOL)
+        # Sequential-lowering state (populated when a runtime-bounded loop is
+        # elaborated into a clocked FSM).
+        self.in_sequential_loop = False
+        self.start: Value | None = None
+        self.done: Value | None = None
 
     def tick(self, where: AST) -> None:
         self.steps += 1
@@ -522,6 +535,17 @@ class Compiler:
             condition_expression, body = children
         else:
             body, condition_expression = children
+        if kind != "do_stmt" and condition_expression is not None:
+            probe = self.materialize(
+                self.expression(condition_expression, path), condition_expression
+            )
+            if self.graph.constant_value(probe) is None:
+                result = self.lower_sequential_loop(
+                    node, path, condition_expression, step, body, loop, switch
+                )
+                for output in result:
+                    output.scopes.pop()
+                return self.merge(result)
         active, done = [path], []
         iteration = 0
         while active:
@@ -566,6 +590,141 @@ class Compiler:
         for output in done:
             output.scopes.pop()
         return self.merge(done)
+
+    def collect_assigned(self, node: AST, names: set[str]) -> None:
+        """Record every name that a statement (or its descendants) assigns to."""
+        if node.kind == "assignment":
+            target = node.children[0]
+            if target.kind in {"variable", "index"}:
+                names.add(target.children[0])
+        elif node.kind in {"post_update", "pre_update"}:
+            target = node.children[0 if node.kind == "post_update" else 1]
+            if target.kind in {"variable", "index"}:
+                names.add(target.children[0])
+        for child in node.children:
+            if isinstance(child, AST):
+                self.collect_assigned(child, names)
+
+    def control_start(self) -> Value:
+        """The implicit ``start`` handshake input, created on first use."""
+        if self.start is None:
+            self.start = self.graph.input("start", BOOL, source_name="start")
+        return self.start
+
+    def lower_sequential_loop(
+        self,
+        node: AST,
+        entry: Path,
+        condition_expression: AST,
+        step: AST | None,
+        body: AST,
+        loop: int,
+        switch: int,
+    ) -> list[Path]:
+        """Lower a runtime-bounded loop into a clocked FSM with registers.
+
+        Loop-carried variables become registers seeded (on ``start``) with their
+        pre-loop values; the loop body is elaborated once to derive each
+        register's next-iteration value; a ``running`` register plus the loop
+        condition sequence one iteration per clock and raise ``done`` on exit.
+        """
+        if len(self.call_stack) != 1:
+            node.fail(
+                "runtime-bounded loops are only supported in the top-level function "
+                "in v1 (called functions must use compile-time bounds)"
+            )
+        if self.graph.constant_value(entry.guard) != 1:
+            node.fail(
+                "a runtime-bounded loop must run unconditionally; placing one inside "
+                "a runtime branch is not supported in v1"
+            )
+        if self.in_sequential_loop:
+            node.fail("nested runtime-bounded loops are not supported in v1")
+        if self.done is not None:
+            node.fail("only one runtime-bounded loop is supported per program in v1")
+
+        assigned: set[str] = set()
+        self.collect_assigned(body, assigned)
+        if step is not None:
+            self.collect_assigned(step, assigned)
+
+        # A carried variable is one that is assigned in the loop and already
+        # exists outside the body; names assigned but declared inside the body
+        # are fresh each iteration and never resolve here.
+        carried: list[tuple[str, dict[str, Binding], Binding]] = []
+        for name in sorted(assigned):
+            for scope in reversed(entry.scopes):
+                if name in scope:
+                    carried.append((name, scope, scope[name]))
+                    break
+
+        self.in_sequential_loop = True
+        try:
+            registers: dict[str, Value] = {}
+            preloop: dict[str, Value] = {}
+            for name, _, binding in carried:
+                if binding.array:
+                    node.fail(
+                        f"array variable '{name}' cannot be carried through a "
+                        "runtime-bounded loop in v1"
+                    )
+                if binding.values[0] is None:
+                    node.fail(
+                        f"loop variable '{name}' must be initialized before a "
+                        "runtime-bounded loop"
+                    )
+                preloop[name] = binding.values[0]
+                registers[name] = self.graph.register(binding.type)
+
+            # Elaborate the condition and one iteration against the register
+            # outputs (the "current" state).
+            state = entry.copy()
+            for name, _, binding in carried:
+                scope, current = state.lookup(name, node)
+                scope[name] = replace(current, values=(registers[name],))
+
+            condition = self.graph.truth(
+                self.materialize(self.expression(condition_expression, state), node)
+            )
+
+            body_paths = self.scoped(body, state, loop + 1, switch)
+            for output in body_paths:
+                if output.flow != "normal":
+                    node.fail(
+                        "break, continue, and return inside a runtime-bounded loop "
+                        "are not supported in v1"
+                    )
+            body_paths = self.merge(body_paths)
+            if len(body_paths) != 1:
+                node.fail("could not converge the loop body into a single next state")
+            body_state = body_paths[0]
+            if step is not None:
+                self.statement(step, body_state, loop + 1, switch)
+
+            # Wire the FSM: start loads the pre-loop values, each running tick
+            # loads the next-iteration values, exit holds the final values.
+            start = self.control_start()
+            running = self.graph.register(BOOL)
+            active = self.graph.op("and", BOOL, running, condition)
+            enable = self.graph.op("or", BOOL, start, active)
+            for name, _, _ in carried:
+                register = registers[name]
+                next_value = self.graph.mux(
+                    start, preloop[name], body_state.lookup(name, node)[1].values[0]
+                )
+                self.graph.set_register(register, next_value, enable)
+            self.graph.set_register(running, enable, self.true)
+            self.done = self.graph.op(
+                "and", BOOL, running, self.graph.op("not", BOOL, condition)
+            )
+
+            # After the loop the carried variables read from their registers,
+            # which hold the settled final values when `done` asserts.
+            for name, scope, binding in carried:
+                scope[name] = replace(binding, values=(registers[name],))
+        finally:
+            self.in_sequential_loop = False
+        return [entry]
 
     def lower_switch(self, node: AST, path: Path, loop: int, switch: int) -> list[Path]:
         selector = self.materialize(self.expression(node.children[0], path), node)
@@ -720,6 +879,10 @@ class Compiler:
             function.fail("flattened input port names collide; rename parameters")
         result = self.call(top, arguments, function)
         self.graph.output("result", result)
+        if self.done is not None:
+            # A runtime-bounded loop made the top function sequential: expose the
+            # handshake so a caller knows when `result` has settled.
+            self.graph.output("done", self.done)
         self.graph.validate()
         return self.graph
 

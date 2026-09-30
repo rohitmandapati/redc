@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.resources import files
+
 from lark import Lark, Transformer, UnexpectedInput
 
 

@@ -8,14 +8,14 @@ from typing import Annotated
 
 import typer
 
-from .backends import emit_systemverilog
+from .backends import DEFAULT_BACKEND, available_backends, get_backend
 from .compiler import Limits, compile_source
 from .parser import CompileError
 
 app = typer.Typer(
     name="redc",
     no_args_is_help=True,
-    help="Compile stateless RedC programs into combinational hardware.",
+    help="Compile RedC programs into combinational or clocked SystemVerilog.",
 )
 
 SourcePath = Annotated[
@@ -41,14 +41,22 @@ def _compile(source: Path, top: str, limits: Limits):
 @app.command()
 def build(
     source: SourcePath,
+    backend: Annotated[
+        str,
+        typer.Option(
+            "--backend",
+            "-b",
+            help="Output backend (see `redc backends` for the full list).",
+        ),
+    ] = DEFAULT_BACKEND,
     output: Annotated[
         Path | None,
-        typer.Option("--output", "-o", help="SystemVerilog output path."),
+        typer.Option("--output", "-o", help="Output path (defaults under build/)."),
     ] = None,
     top: Annotated[str, typer.Option(help="Top-level RedC function.")] = "main",
     module: Annotated[
         str | None,
-        typer.Option(help="Generated SystemVerilog module name."),
+        typer.Option(help="Generated module name (HDL backends)."),
     ] = None,
     emit_ir: Annotated[
         bool,
@@ -64,14 +72,20 @@ def build(
         int, typer.Option(min=1, help="Maximum compile-time lowering steps.")
     ] = 100_000,
 ) -> None:
-    """Compile SOURCE into a combinational SystemVerilog module."""
+    """Compile SOURCE with the chosen backend (SystemVerilog by default)."""
+    try:
+        target = get_backend(backend)
+    except CompileError as error:
+        typer.echo(f"redc: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
     graph = _compile(source, top, _limits(max_unroll, max_nodes, max_steps))
-    output = output or Path("build") / f"{source.stem}.sv"
+    output = output or Path("build") / f"{source.stem}{target.extension}"
     module = module or f"redc_{top}"
     try:
-        systemverilog = emit_systemverilog(graph, module)
+        artifact = target.emit(graph, module)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(systemverilog, encoding="utf-8")
+        output.write_text(artifact, encoding="utf-8")
         if emit_ir:
             output.with_suffix(".ir.json").write_text(graph.to_json(), encoding="utf-8")
     except (CompileError, OSError) as error:
@@ -80,8 +94,19 @@ def build(
 
     operations = Counter(node["op"] for node in graph.live_nodes())
     summary = ", ".join(f"{name}={count}" for name, count in sorted(operations.items()))
-    typer.echo(f"Wrote {output}")
+    typer.echo(f"Wrote {output} ({target.name})")
     typer.echo(f"IR: {len(graph.live_nodes())} live nodes ({summary})")
+
+
+@app.command()
+def backends() -> None:
+    """List the available output backends."""
+    from .backends import BACKENDS
+
+    for name in available_backends():
+        target = BACKENDS[name]
+        default = " (default)" if name == DEFAULT_BACKEND else ""
+        typer.echo(f"{name}{default}\t{target.extension}\t{target.summary}")
 
 
 @app.command()
