@@ -23,8 +23,12 @@ class AST:
 
 class BuildAST(Transformer):
     def __default__(self, data, children, meta):
-        return AST(str(data), tuple(children), getattr(meta, 'line', 0),
-                   getattr(meta, 'column', 0))
+        return AST(
+            str(data),
+            tuple(children),
+            getattr(meta, "line", 0),
+            getattr(meta, "column", 0),
+        )
 
     def __default_token__(self, token):
         return str(token)

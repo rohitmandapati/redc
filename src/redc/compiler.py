@@ -1,12 +1,13 @@
-"""Lower straight-line RedC functions into the combinational IR.
+"""Elaborate RedC source into a finite combinational graph.
 
-This first lowering pass handles pure expressions, local assignments, and
-inlined function calls. 
+Branches execute on separate environments and merge with mux nodes. Loops run
+at compile time and emit repeated hardware. Function calls inline. Source-level
+assignment only creates a new signal value; it never implies a register.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .ir import BOOL, Graph, IRType, Literal, Value, type_from_name
 from .parser import AST, CompileError, parse
@@ -21,22 +22,25 @@ class Limits:
     call_depth: int = 64
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Binding:
     type: IRType
-    value: Value | None
+    values: tuple[Value | None, ...]
+    array: bool = False
     const: bool = False
 
 
-class Environment:
-    def __init__(self, scopes: list[dict[str, Binding]] | None = None) -> None:
-        self.scopes = scopes or [{}]
+@dataclass
+class Path:
+    scopes: list[dict[str, Binding]]
+    guard: Value
+    flow: str = "normal"
+    result: Value | None = None
 
-    def push(self) -> None:
-        self.scopes.append({})
-
-    def pop(self) -> None:
-        self.scopes.pop()
+    def copy(self) -> Path:
+        return Path(
+            [scope.copy() for scope in self.scopes], self.guard, self.flow, self.result
+        )
 
     def lookup(self, name: str, where: AST) -> tuple[dict[str, Binding], Binding]:
         for scope in reversed(self.scopes):
@@ -83,35 +87,47 @@ class Compiler:
         if self.steps > self.limits.steps:
             where.fail(f"compile-time work budget exceeded ({self.limits.steps})")
 
-    def materialize(self, value: Value | Literal, where: AST) -> Value:
-        if isinstance(value, Value):
-            return value
-        number = value.number
-        if -(1 << 31) <= number < (1 << 31):
-            typ = IRType(32, signed=True)
-        elif -(1 << 63) <= number < (1 << 63):
-            typ = IRType(64, signed=True)
-        elif 0 <= number < (1 << 64):
-            typ = IRType(64)
-        else:
-            where.fail("integer literal exceeds the supported 64-bit range")
-        return self.graph.constant(number, typ)
+    def materialize(self, value, where: AST) -> Value:
+        if isinstance(value, Literal):
+            number = value.number
+            if -(1 << 31) <= number < (1 << 31):
+                typ = IRType(32, signed=True)
+            elif -(1 << 63) <= number < (1 << 63):
+                typ = IRType(64, signed=True)
+            elif 0 <= number < (1 << 64):
+                typ = IRType(64)
+            else:
+                where.fail("integer literal exceeds the supported 64-bit range")
+            return self.graph.constant(number, typ)
+        if not isinstance(value, Value):
+            where.fail(
+                "expected a scalar value (arrays and void are not scalar expressions)"
+            )
+        return value
 
-    def convert(self, value: Value | Literal, typ: IRType | None, where: AST) -> Value:
+    def convert(self, value, typ: IRType | None, where: AST) -> Value:
         if typ is None:
             where.fail("void is not a value type")
         if isinstance(value, Literal):
             self.materialize(value, where)
             return self.graph.cast(value, typ)
-        return self.graph.cast(value, typ)
+        return self.graph.cast(self.materialize(value, where), typ)
 
-    def pair(
-        self, left: Value | Literal, right: Value | Literal, where: AST
-    ) -> tuple[Value, Value]:
+    def contextual_literal(self, literal: Literal, typ: IRType, where: AST) -> Value:
+        low = -(1 << (typ.width - 1)) if typ.signed else 0
+        high = (1 << (typ.width - int(typ.signed))) - 1
+        if not low <= literal.number <= high:
+            where.fail(
+                f"literal {literal.number} does not fit the other operand; "
+                "widen the operand or explicitly cast the literal"
+            )
+        return self.convert(literal, typ, where)
+
+    def pair(self, left, right, where: AST) -> tuple[Value, Value]:
         if isinstance(left, Literal) and isinstance(right, Value):
-            return self.convert(left, right.type, where), right
+            return self.contextual_literal(left, right.type, where), right
         if isinstance(right, Literal) and isinstance(left, Value):
-            return left, self.convert(right, left.type, where)
+            return left, self.contextual_literal(right, left.type, where)
         left_value = self.materialize(left, where)
         right_value = self.materialize(right, where)
         if left_value.type == right_value.type:
@@ -127,16 +143,14 @@ class Compiler:
         )
         return self.graph.cast(left_value, typ), self.graph.cast(right_value, typ)
 
-    def binary(
-        self,
-        operator: str,
-        left: Value | Literal,
-        right: Value | Literal,
-        where: AST,
-    ) -> Value:
+    def binary(self, operator: str, left, right, where: AST) -> Value:
         if operator in {"<<", ">>"}:
             left_value = self.materialize(left, where)
-            right_value = self.graph.cast(self.materialize(right, where), IRType(64))
+            right_value = self.materialize(right, where)
+            constant = self.graph.constant_value(right_value)
+            if constant is not None and right_value.type.number(constant) < 0:
+                where.fail("negative constant shift count")
+            right_value = self.graph.cast(right_value, IRType(64))
             return self.graph.op(
                 BINARY_OPS[operator], left_value.type, left_value, right_value
             )
@@ -146,7 +160,14 @@ class Compiler:
         )
         return self.graph.op(BINARY_OPS[operator], typ, left_value, right_value)
 
-    def expression(self, node: AST, env: Environment) -> Value | Literal | None:
+    def constant_integer(self, expression: AST, path: Path, label: str) -> int:
+        value = self.materialize(self.expression(expression, path), expression)
+        bits = self.graph.constant_value(value)
+        if bits is None:
+            expression.fail(f"{label} must be known at compile time")
+        return value.type.number(bits)
+
+    def expression(self, node: AST, path: Path):
         self.tick(node)
         kind, children = node.kind, node.children
         if kind == "integer":
@@ -162,13 +183,36 @@ class Compiler:
         if kind in {"true_value", "false_value"}:
             return self.true if kind == "true_value" else self.false
         if kind == "variable":
-            _, binding = env.lookup(children[0], node)
-            if binding.value is None:
+            _, binding = path.lookup(children[0], node)
+            if any(value is None for value in binding.values):
                 node.fail(f"'{children[0]}' may be read before initialization")
-            return binding.value
+            return binding if binding.array else binding.values[0]
+        if kind == "index":
+            _, binding = path.lookup(children[0], node)
+            if not binding.array:
+                node.fail(f"'{children[0]}' is not an array")
+            index = self.materialize(self.expression(children[1], path), node)
+            constant = self.graph.constant_value(index)
+            if constant is not None:
+                position = index.type.number(constant)
+                if not 0 <= position < len(binding.values):
+                    node.fail("constant array index out of bounds")
+                if binding.values[position] is None:
+                    node.fail("array element read before initialization")
+                return binding.values[position]
+            if any(value is None for value in binding.values):
+                node.fail("dynamic array read requires every element to be initialized")
+            index = self.index_type(index, len(binding.values))
+            result = self.graph.constant(0, binding.type)
+            for position, value in enumerate(binding.values):
+                equal = self.graph.op(
+                    "eq", BOOL, index, self.graph.constant(position, index.type)
+                )
+                result = self.graph.mux(equal, value, result)
+            return result
         if kind == "unary":
             operator, operand = children
-            value = self.expression(operand, env)
+            value = self.expression(operand, path)
             if isinstance(value, Literal) and operator in {"+", "-", "~"}:
                 return Literal(
                     value.number
@@ -177,59 +221,80 @@ class Compiler:
                     if operator == "-"
                     else ~value.number
                 )
-            materialized = self.materialize(value, node)
+            value = self.materialize(value, node)
             if operator == "+":
-                return materialized
+                return value
             if operator == "!":
-                return self.graph.op("not", BOOL, self.graph.truth(materialized))
-            return self.graph.op(
-                "neg" if operator == "-" else "inv", materialized.type, materialized
-            )
+                return self.graph.op("not", BOOL, self.graph.truth(value))
+            return self.graph.op("neg" if operator == "-" else "inv", value.type, value)
         if kind == "cast":
             return self.convert(
-                self.expression(children[1], env), type_from_name(children[0]), node
+                self.expression(children[1], path), type_from_name(children[0]), node
             )
         if kind == "binary":
             left_node, operator, right_node = children
-            left = self.expression(left_node, env)
+            left = self.expression(left_node, path)
             if operator in {"&&", "||"}:
                 left_value = self.graph.truth(self.materialize(left, left_node))
+                constant = self.graph.constant_value(left_value)
+                if constant is not None and (
+                    (operator == "&&" and not constant)
+                    or (operator == "||" and constant)
+                ):
+                    return left_value
                 right_value = self.graph.truth(
-                    self.materialize(self.expression(right_node, env), right_node)
+                    self.materialize(self.expression(right_node, path), right_node)
                 )
                 return self.graph.op(
                     "and" if operator == "&&" else "or", BOOL, left_value, right_value
                 )
-            return self.binary(operator, left, self.expression(right_node, env), node)
+            return self.binary(operator, left, self.expression(right_node, path), node)
         if kind == "ternary":
             condition = self.graph.truth(
-                self.materialize(self.expression(children[0], env), node)
+                self.materialize(self.expression(children[0], path), node)
             )
+            constant = self.graph.constant_value(condition)
+            if constant is not None:
+                return self.expression(children[1] if constant else children[2], path)
             yes, no = self.pair(
-                self.expression(children[1], env),
-                self.expression(children[2], env),
+                self.expression(children[1], path),
+                self.expression(children[2], path),
                 node,
             )
             return self.graph.mux(condition, yes, no)
         if kind == "call":
             arguments = children[1].children if len(children) > 1 else ()
             return self.call(
-                children[0], [self.expression(arg, env) for arg in arguments], node
+                children[0],
+                [self.expression(argument, path) for argument in arguments],
+                node,
             )
-        node.fail(f"unsupported expression '{kind}' in straight-line lowering")
+        node.fail(f"unsupported expression {kind}")
 
-    @staticmethod
-    def _declaration_parts(node: AST) -> tuple[bool, str, str, AST | None]:
+    def index_type(self, index: Value, size: int) -> Value:
+        width = max(index.type.width, size.bit_length() + int(index.type.signed))
+        return self.graph.cast(index, IRType(width, index.type.signed))
+
+    def declare(self, node: AST, path: Path, *, global_: bool = False) -> None:
         children = list(node.children)
         const = children[0] == "const"
         if const:
             children.pop(0)
-        type_name, name = children.pop(0), children.pop(0)
-        if any(
-            isinstance(child, AST) and child.kind == "array_size" for child in children
-        ):
-            node.fail("arrays require the structured-control lowering stage")
-        initializer = next(
+        typ = type_from_name(children.pop(0))
+        name = children.pop(0)
+        if typ is None:
+            node.fail("variables cannot have type void")
+        if name in path.scopes[-1]:
+            node.fail(f"duplicate declaration '{name}'")
+        size_node = next(
+            (
+                child
+                for child in children
+                if isinstance(child, AST) and child.kind == "array_size"
+            ),
+            None,
+        )
+        init_node = next(
             (
                 child
                 for child in children
@@ -237,135 +302,373 @@ class Compiler:
             ),
             None,
         )
-        return const, type_name, name, initializer
-
-    def declare(self, node: AST, env: Environment, *, global_: bool = False) -> None:
-        const, type_name, name, initializer = self._declaration_parts(node)
-        typ = type_from_name(type_name)
-        if typ is None:
-            node.fail("variables cannot have type void")
-        if name in env.scopes[-1]:
-            node.fail(f"duplicate declaration '{name}'")
+        array = size_node is not None
+        size = (
+            self.constant_integer(size_node.children[0], path, "array length")
+            if array
+            else 1
+        )
+        if not 1 <= size <= self.limits.array_elements:
+            node.fail(f"array length must be 1..{self.limits.array_elements}")
         if global_ and not const:
             node.fail("globals must be const; persistent state is unsupported")
-        value = None
-        if initializer is not None:
-            init = initializer.children[0]
-            if init.kind == "array_init":
-                init.fail("array initializers require an array declaration")
-            value = self.convert(self.expression(init, env), typ, init)
+        values: list[Value | None] = [None] * size
+        if init_node:
+            initializer = init_node.children[0]
+            if array:
+                if initializer.kind != "array_init":
+                    node.fail("array initialization requires { ... }")
+                if len(initializer.children) > size:
+                    node.fail("too many array initializer elements")
+                values = [
+                    self.convert(self.expression(item, path), typ, item)
+                    for item in initializer.children
+                ]
+                values += [self.graph.constant(0, typ)] * (size - len(values))
+            else:
+                if initializer.kind == "array_init":
+                    node.fail("scalar initialization requires an expression")
+                values = [
+                    self.convert(self.expression(initializer, path), typ, initializer)
+                ]
         elif const:
             node.fail("const declarations require an initializer")
-        if global_ and value is not None and self.graph.constant_value(value) is None:
+        if global_ and any(
+            value is None or self.graph.constant_value(value) is None
+            for value in values
+        ):
             node.fail("global constant initializer must be known at compile time")
-        env.scopes[-1][name] = Binding(typ, value, const)
+        path.scopes[-1][name] = Binding(typ, tuple(values), array, const)
 
-    def assign(
-        self, target: AST, rhs: Value | Literal | None, env: Environment, operator: str
-    ) -> None:
-        if target.kind != "variable":
-            target.fail(
-                "array assignment requires the structured-control lowering stage"
-            )
+    def assign(self, target: AST, rhs, path: Path, operator: str = "=") -> None:
         name = target.children[0]
-        scope, binding = env.lookup(name, target)
+        scope, binding = path.lookup(name, target)
         if binding.const:
             target.fail(f"cannot assign to const '{name}'")
         if operator != "=":
-            if binding.value is None:
-                target.fail(f"'{name}' may be read before initialization")
-            rhs = self.binary(operator[:-1], binding.value, rhs, target)
-        scope[name] = Binding(binding.type, self.convert(rhs, binding.type, target))
+            rhs = self.binary(operator[:-1], self.expression(target, path), rhs, target)
+        rhs = self.convert(rhs, binding.type, target)
+        if target.kind == "variable":
+            if binding.array:
+                target.fail("whole-array assignment is unsupported")
+            values = (rhs,)
+        else:
+            if not binding.array:
+                target.fail(f"'{name}' is not an array")
+            index = self.materialize(self.expression(target.children[1], path), target)
+            constant = self.graph.constant_value(index)
+            values = list(binding.values)
+            if constant is not None:
+                position = index.type.number(constant)
+                if not 0 <= position < len(values):
+                    target.fail("constant array index out of bounds")
+                values[position] = rhs
+            else:
+                if any(value is None for value in values):
+                    target.fail("dynamic array write requires an initialized array")
+                index = self.index_type(index, len(values))
+                for position, value in enumerate(values):
+                    equal = self.graph.op(
+                        "eq", BOOL, index, self.graph.constant(position, index.type)
+                    )
+                    values[position] = self.graph.mux(equal, rhs, value)
+        scope[name] = replace(binding, values=tuple(values))
+
+    def merge(self, paths: list[Path]) -> list[Path]:
+        groups: dict[tuple, Path] = {}
+        for path in paths:
+            if self.graph.constant_value(path.guard) == 0:
+                continue
+            shape = tuple(tuple(sorted(scope)) for scope in path.scopes)
+            key = (path.flow, shape)
+            if key not in groups:
+                groups[key] = path.copy()
+                continue
+            old = groups[key]
+            for old_scope, new_scope in zip(old.scopes, path.scopes):
+                for name, binding in old_scope.items():
+                    other = new_scope[name]
+                    values = tuple(
+                        None
+                        if left is None or right is None
+                        else self.graph.mux(path.guard, right, left)
+                        for left, right in zip(binding.values, other.values)
+                    )
+                    old_scope[name] = replace(binding, values=values)
+            if path.result is not None:
+                old.result = (
+                    path.result
+                    if old.result is None
+                    else self.graph.mux(path.guard, path.result, old.result)
+                )
+            old.guard = self.graph.op("or", BOOL, old.guard, path.guard)
+        return list(groups.values())
+
+    def sequence(
+        self,
+        statements: tuple[AST, ...] | list[AST],
+        paths: list[Path],
+        loop: int = 0,
+        switch: int = 0,
+    ) -> list[Path]:
+        for statement in statements:
+            next_paths = []
+            for path in paths:
+                next_paths.extend(
+                    self.statement(statement, path, loop, switch)
+                    if path.flow == "normal"
+                    else [path]
+                )
+            paths = self.merge(next_paths)
+        return paths
+
+    def scoped(self, statement: AST, path: Path, loop: int, switch: int) -> list[Path]:
+        path = path.copy()
+        path.scopes.append({})
+        body = statement.children if statement.kind == "block" else (statement,)
+        paths = self.sequence(body, [path], loop, switch)
+        for result in paths:
+            result.scopes.pop()
+        return paths
 
     def statement(
-        self, node: AST, env: Environment, return_type: IRType | None
-    ) -> Value | None:
+        self, node: AST, path: Path, loop: int = 0, switch: int = 0
+    ) -> list[Path]:
         self.tick(node)
         kind, children = node.kind, node.children
         if kind == "block":
-            env.push()
-            try:
-                return self.sequence(children, env, return_type)
-            finally:
-                env.pop()
+            return self.scoped(node, path, loop, switch)
         if kind in {"decl_stmt", "declaration"}:
-            self.declare(children[0] if kind == "decl_stmt" else node, env)
-            return None
-        if kind == "assignment":
+            self.declare(children[0] if kind == "decl_stmt" else node, path)
+        elif kind == "assignment":
             self.assign(
-                children[0], self.expression(children[2], env), env, children[1]
+                children[0], self.expression(children[2], path), path, children[1]
             )
-            return None
-        if kind in {"post_update", "pre_update"}:
+        elif kind in {"post_update", "pre_update"}:
             target, operator = (
                 children if kind == "post_update" else (children[1], children[0])
             )
-            self.assign(target, Literal(1), env, "+=" if operator == "++" else "-=")
-            return None
-        if kind == "expr_stmt":
-            self.expression(children[0], env)
-            return None
-        if kind == "return_stmt":
+            self.assign(target, Literal(1), path, "+=" if operator == "++" else "-=")
+        elif kind == "expr_stmt":
+            self.expression(children[0], path)
+        elif kind == "return_stmt":
+            return_type = type_from_name(
+                self.functions[self.call_stack[-1]].children[0]
+            )
             if return_type is None and children:
                 node.fail("void function cannot return a value")
             if return_type is not None and not children:
                 node.fail("non-void function must return a value")
-            return (
-                self.convert(self.expression(children[0], env), return_type, node)
+            path.result = (
+                self.convert(self.expression(children[0], path), return_type, node)
                 if children
                 else None
             )
-        if kind == "empty_stmt":
-            return None
-        node.fail(f"unsupported statement '{kind}' in straight-line lowering")
+            path.flow = "return"
+        elif kind == "break_stmt":
+            if not (loop or switch):
+                node.fail("break requires a loop or switch")
+            path.flow = "break"
+        elif kind == "continue_stmt":
+            if not loop:
+                node.fail("continue requires a loop")
+            path.flow = "continue"
+        elif kind == "if_stmt":
+            condition = self.graph.truth(
+                self.materialize(self.expression(children[0], path), node)
+            )
+            constant = self.graph.constant_value(condition)
+            if constant is not None:
+                if constant:
+                    return self.scoped(children[1], path, loop, switch)
+                return (
+                    self.scoped(children[2], path, loop, switch)
+                    if len(children) > 2
+                    else [path]
+                )
+            yes, no = path.copy(), path.copy()
+            yes.guard = self.graph.op("and", BOOL, path.guard, condition)
+            no.guard = self.graph.op(
+                "and", BOOL, path.guard, self.graph.op("not", BOOL, condition)
+            )
+            return self.merge(
+                self.scoped(children[1], yes, loop, switch)
+                + (
+                    self.scoped(children[2], no, loop, switch)
+                    if len(children) > 2
+                    else [no]
+                )
+            )
+        elif kind in {"for_stmt", "while_stmt", "do_stmt"}:
+            return self.unroll(node, path, loop, switch)
+        elif kind == "switch_stmt":
+            return self.lower_switch(node, path, loop, switch)
+        elif kind != "empty_stmt":
+            node.fail(f"unsupported statement {kind}")
+        return [path]
 
-    def sequence(
-        self, statements: tuple[AST, ...], env: Environment, return_type: IRType | None
-    ) -> Value | None:
-        for statement in statements:
-            result = self.statement(statement, env, return_type)
-            if statement.kind == "return_stmt" or result is not None:
-                return result
-        return None
+    def unroll(self, node: AST, path: Path, loop: int, switch: int) -> list[Path]:
+        children, kind = node.children, node.kind
+        path = path.copy()
+        path.scopes.append({})
+        step = None
+        if kind == "for_stmt":
+            initializer, condition, step_node, body = children
+            if initializer.children:
+                self.statement(initializer.children[0], path, loop, switch)
+            condition_expression = condition.children[0] if condition.children else None
+            step = step_node.children[0] if step_node.children else None
+        elif kind == "while_stmt":
+            condition_expression, body = children
+        else:
+            body, condition_expression = children
+        active, done = [path], []
+        iteration = 0
+        while active:
+            running = []
+            for current in active:
+                if (
+                    kind == "do_stmt" and iteration == 0
+                ) or condition_expression is None:
+                    test = 1
+                else:
+                    test = self.constant_integer(
+                        condition_expression,
+                        current,
+                        "loop condition (use a fixed bound and if/break for runtime decisions)",
+                    )
+                if test:
+                    running.append(current)
+                else:
+                    done.append(current)
+            if not running:
+                break
+            if iteration >= self.limits.loop_iterations:
+                node.fail(
+                    f"loop unroll limit exceeded ({self.limits.loop_iterations}); "
+                    "check the bound, increment, and integer overflow"
+                )
+            next_active = []
+            for current in running:
+                for output in self.scoped(body, current, loop + 1, switch):
+                    if output.flow == "return":
+                        done.append(output)
+                    elif output.flow == "break":
+                        output.flow = "normal"
+                        done.append(output)
+                    else:
+                        output.flow = "normal"
+                        if step:
+                            self.statement(step, output, loop + 1, switch)
+                        next_active.append(output)
+            active = self.merge(next_active)
+            iteration += 1
+        for output in done:
+            output.scopes.pop()
+        return self.merge(done)
 
-    @staticmethod
-    def _function_parts(function: AST) -> tuple[str, str, tuple[AST, ...], AST]:
-        return_type, name, *rest = function.children
-        parameters = rest[0].children if rest[0].kind == "parameters" else ()
-        return return_type, name, parameters, rest[-1]
+    def lower_switch(self, node: AST, path: Path, loop: int, switch: int) -> list[Path]:
+        selector = self.materialize(self.expression(node.children[0], path), node)
+        arms = node.children[1:]
+        cases = []
+        default = None
+        seen = set()
+        for index, arm in enumerate(arms):
+            if arm.kind == "default_arm":
+                if default is not None:
+                    arm.fail("duplicate default label")
+                default = index
+            else:
+                raw = self.constant_integer(arm.children[0], path, "case label")
+                bits = raw & selector.type.mask
+                if bits in seen:
+                    arm.fail("duplicate case label after conversion to switch type")
+                seen.add(bits)
+                equal = self.graph.op(
+                    "eq", BOOL, selector, self.graph.constant(bits, selector.type)
+                )
+                cases.append((index, equal))
+        matched = self.false
+        for _, condition in cases:
+            matched = self.graph.op("or", BOOL, matched, condition)
+        cases.append((default, self.graph.op("not", BOOL, matched)))
+        results = []
+        for start, condition in cases:
+            current = path.copy()
+            current.guard = self.graph.op("and", BOOL, current.guard, condition)
+            if self.graph.constant_value(current.guard) == 0:
+                continue
+            if start is None:
+                results.append(current)
+                continue
+            current.scopes.append({})
+            statements = []
+            for arm in arms[start:]:
+                body = arm.children[1:] if arm.kind == "case_arm" else arm.children
+                if any(statement.kind == "decl_stmt" for statement in body):
+                    arm.fail("put switch-local declarations inside { } blocks")
+                statements.extend(body)
+            outputs = self.sequence(statements, [current], loop, switch + 1)
+            for output in outputs:
+                output.scopes.pop()
+                if output.flow == "break":
+                    output.flow = "normal"
+            results.extend(outputs)
+        return self.merge(results)
 
-    def call(
-        self, name: str, arguments: list[Value | Literal | None], where: AST
-    ) -> Value | None:
+    def call(self, name: str, arguments: list, where: AST):
         if name not in self.functions:
             where.fail(f"unknown function '{name}'")
         if name in self.call_stack:
             where.fail("recursive calls are not supported")
         if len(self.call_stack) >= self.limits.call_depth:
             where.fail("function expansion depth exceeded")
-        return_name, _, parameters, body = self._function_parts(self.functions[name])
+        function = self.functions[name]
+        return_type_name, _, *rest = function.children
+        parameters = rest[0].children if rest[0].kind == "parameters" else ()
+        body = rest[-1]
         if len(arguments) != len(parameters):
             where.fail(f"'{name}' expects {len(parameters)} arguments")
-        env = Environment([self.globals.copy(), {}])
+        path = Path([self.globals.copy(), {}], self.true)
         for parameter, argument in zip(parameters, arguments):
             type_name, parameter_name, *shape = parameter.children
-            if shape:
-                parameter.fail(
-                    "array parameters require the structured-control lowering stage"
-                )
             typ = type_from_name(type_name)
             if typ is None:
                 parameter.fail("parameters cannot have type void")
-            env.scopes[-1][parameter_name] = Binding(
-                typ, self.convert(argument, typ, parameter)
-            )
+            if parameter_name in path.scopes[-1]:
+                parameter.fail("duplicate parameter name")
+            if shape:
+                size = self.constant_integer(
+                    shape[0].children[0], path, "parameter array length"
+                )
+                if (
+                    not isinstance(argument, Binding)
+                    or not argument.array
+                    or len(argument.values) != size
+                ):
+                    parameter.fail("array argument has the wrong shape")
+                values = tuple(
+                    self.convert(value, typ, parameter) for value in argument.values
+                )
+                binding = Binding(typ, values, True)
+            else:
+                binding = Binding(typ, (self.convert(argument, typ, parameter),))
+            path.scopes[-1][parameter_name] = binding
         self.call_stack.append(name)
         try:
-            result = self.sequence(body.children, env, type_from_name(return_name))
+            outputs = self.sequence(body.children, [path])
         finally:
             self.call_stack.pop()
-        if type_from_name(return_name) is not None and result is None:
-            where.fail(f"function '{name}' does not return a value")
+        return_type = type_from_name(return_type_name)
+        if return_type is None:
+            return None
+        if any(output.flow != "return" for output in outputs):
+            function.fail(f"function '{name}' does not return on every reachable path")
+        if not outputs:
+            function.fail(f"function '{name}' has no return")
+        result = outputs[0].result
+        for output in outputs[1:]:
+            result = self.graph.mux(output.guard, output.result, result)
         return result
 
     def compile(self, source: str, top: str = "main") -> Graph:
@@ -377,29 +680,45 @@ class Compiler:
                 if name in self.functions:
                     item.fail(f"duplicate function '{name}'")
                 self.functions[name] = item
-        global_env = Environment([self.globals])
+        globals_path = Path([self.globals], self.true)
         for item in ast.children:
             if item.kind == "global_decl":
-                self.declare(item.children[0], global_env, global_=True)
+                self.declare(item.children[0], globals_path, global_=True)
+        if set(self.functions) & set(self.globals):
+            raise CompileError("a global and a function cannot have the same name")
         if top not in self.functions:
             raise CompileError(f"top function '{top}' not found")
-        return_type, _, parameters, _ = self._function_parts(self.functions[top])
-        if type_from_name(return_type) is None:
-            self.functions[top].fail("top function must return a scalar value")
+        function = self.functions[top]
+        if type_from_name(function.children[0]) is None:
+            function.fail("top function must return a scalar value")
+        parameters = (
+            function.children[2].children
+            if function.children[2].kind == "parameters"
+            else ()
+        )
         arguments = []
         for parameter in parameters:
             type_name, name, *shape = parameter.children
-            if shape:
-                parameter.fail(
-                    "array inputs require the structured-control lowering stage"
-                )
             typ = type_from_name(type_name)
             if typ is None:
                 parameter.fail("input cannot have type void")
-            arguments.append(self.graph.input(f"in_{name}", typ, source_name=name))
-        result = self.call(top, arguments, self.functions[top])
-        if not isinstance(result, Value):
-            self.functions[top].fail("top function did not produce a scalar value")
+            if shape:
+                size = self.constant_integer(
+                    shape[0].children[0], globals_path, "input array length"
+                )
+                if not 1 <= size <= self.limits.array_elements:
+                    parameter.fail("input array too large or empty")
+                values = tuple(
+                    self.graph.input(f"in_{name}_{index}", typ, source_name=name)
+                    for index in range(size)
+                )
+                arguments.append(Binding(typ, values, True))
+            else:
+                arguments.append(self.graph.input(f"in_{name}", typ, source_name=name))
+        port_names = [port["name"] for port in self.graph.inputs]
+        if len(set(port_names)) != len(port_names):
+            function.fail("flattened input port names collide; rename parameters")
+        result = self.call(top, arguments, function)
         self.graph.output("result", result)
         self.graph.validate()
         return self.graph
