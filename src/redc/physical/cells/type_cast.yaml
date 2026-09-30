@@ -1,0 +1,14 @@
+# Type-cast cells.  The two pins carry different datatypes, so there is no family
+# default -- every pin names its own.  Key convention:
+#   <src>_to_<dst>_<pin>-<x>-<y>-<z>...
+family: type_cast
+
+variants:
+  uint8_to_uint4_in-0-0-0_out-0-0-0:
+    latency: 0
+    dim: [1, 1, 1]
+    nbt: uint8_to_uint4_in-0-0-0_out-0-0-0.nbt
+    inputs:
+      - {name: in, datatype: uint8, face: WEST, offset: [0, 0, 0]}
+    outputs:
+      - {name: out, datatype: uint4, face: EAST, offset: [0, 0, 0]}
