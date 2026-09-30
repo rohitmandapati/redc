@@ -30,7 +30,7 @@ an event for the place-and-route replay trace.
 from __future__ import annotations
 
 from enum import IntEnum
-from typing import Iterator
+from collections.abc import Iterator
 
 import numpy as np
 

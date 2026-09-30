@@ -63,8 +63,10 @@ def _build(
         "outputs": ports(spec.get("outputs"), PortDir.OUT),
         "nbt": spec.get("nbt"),
     }
-    if "op" in spec:  # only Operation / PrimitiveGate carry an op
-        kwargs["op"] = spec["op"]
+    # Family-specific extra fields, passed through only when present.
+    for extra in ("op", "init"):  # op: Operation / PrimitiveGate;  init: Register
+        if extra in spec:
+            kwargs[extra] = spec[extra]
 
     try:
         return cls(**kwargs)
