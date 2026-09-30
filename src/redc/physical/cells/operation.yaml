@@ -1,0 +1,30 @@
+# Datapath operation cells.  Key = convention name:
+#   <datatype>_<op>_<pin>-<x>-<y>-<z>...   (one <pin>-x-y-z group per port)
+# Every field is explicit; the key is the canonical id, not parsed for data.
+family: operation
+datatype: uint8          # family default; a pin may override with its own datatype
+
+variants:
+  uint8_add_a-0-0-0_b-0-0-1_out-0-0-2:
+    op: add
+    latency: 0
+    dim: [1, 1, 3]
+    nbt: uint8_add_a-0-0-0_b-0-0-1_out-0-0-2.nbt
+    inputs:
+      - {name: a, face: WEST, offset: [0, 0, 0]}
+      - {name: b, face: WEST, offset: [0, 0, 1]}
+    outputs:
+      - {name: out, face: EAST, offset: [0, 0, 2]}
+
+  # Same op, inputs stacked vertically instead of along z -- a variant the
+  # router can pick when neighbours constrain the z axis.
+  uint8_add_a-0-0-0_b-0-1-0_out-0-2-0:
+    op: add
+    latency: 0
+    dim: [1, 3, 1]
+    nbt: uint8_add_a-0-0-0_b-0-1-0_out-0-2-0.nbt
+    inputs:
+      - {name: a, face: WEST, offset: [0, 0, 0]}
+      - {name: b, face: WEST, offset: [0, 1, 0]}
+    outputs:
+      - {name: out, face: EAST, offset: [0, 2, 0]}

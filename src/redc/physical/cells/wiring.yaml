@@ -1,0 +1,13 @@
+# Signal-carrying passthrough cells (buffers / repeaters).
+family: wiring
+datatype: uint8
+
+variants:
+  uint8_buffer_in-0-0-0_out-0-0-0:
+    latency: 1
+    dim: [1, 1, 1]
+    nbt: uint8_buffer_in-0-0-0_out-0-0-0.nbt
+    inputs:
+      - {name: in, face: WEST, offset: [0, 0, 0]}
+    outputs:
+      - {name: out, face: EAST, offset: [0, 0, 0]}

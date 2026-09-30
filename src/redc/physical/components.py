@@ -95,6 +95,9 @@ class Component:
     dim: tuple[int, int, int]
     inputs: tuple[Port, ...]
     outputs: tuple[Port, ...]
+    #: Filename of the NBT structure realising this cell, resolved at emission
+    #: time.  ``None`` for cells that carry no physical implementation yet.
+    nbt: str | None = None
 
     def __post_init__(self) -> None:
         if self.latency < 0:
