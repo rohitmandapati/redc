@@ -86,3 +86,80 @@ def test_occupied_cells_and_snapshot() -> None:
     snapshot = grid.to_dict()
     assert snapshot["height"] == MAX_HEIGHT
     assert len(snapshot["cells"]) == 2
+
+
+# -- routing layer ---------------------------------------------------------
+
+
+def test_neighbors_are_six_connected_and_in_bounds() -> None:
+    grid = Grid()
+    # Open space: all six axis-aligned neighbours.
+    assert set(grid.neighbors(5, 5, 5)) == {
+        (6, 5, 5),
+        (4, 5, 5),
+        (5, 6, 5),
+        (5, 4, 5),
+        (5, 5, 6),
+        (5, 5, 4),
+    }
+    # The floor drops the -y neighbour; the ceiling drops the +y neighbour.
+    assert (0, -1, 0) not in set(grid.neighbors(0, 0, 0))
+    assert (0, MAX_HEIGHT, 0) not in set(grid.neighbors(0, MAX_HEIGHT - 1, 0))
+
+
+def test_component_bodies_block_routing_but_wires_do_not() -> None:
+    grid = Grid()
+    grid.place(1, 0, 0, owner=7)  # a component body
+    assert not grid.is_routable(1, 0, 0)
+    assert (1, 0, 0) not in set(grid.neighbors(0, 0, 0))
+    assert grid.routing_cost(1, 0, 0) == float("inf")
+    # Free space and committed wires are routable.
+    grid.place(2, 0, 0, owner=8, kind=CellKind.WIRE)
+    assert grid.is_routable(2, 0, 0)
+
+
+def test_routing_cost_grows_with_congestion() -> None:
+    grid = Grid()
+    base = grid.routing_cost(0, 0, 0)
+    grid.claim(1, 0, 0, 0)  # one net: within capacity, no overuse penalty
+    assert grid.routing_cost(0, 0, 0) == base
+    grid.claim(2, 0, 0, 0)  # second net: overused -> more expensive
+    assert grid.routing_cost(0, 0, 0) > base
+
+
+def test_claim_allows_overuse_and_rip_up_net_frees_the_whole_route() -> None:
+    grid = Grid()
+    grid.claim(1, 0, 0, 0)
+    grid.claim(1, 1, 0, 0)  # net 1 spans two cells
+    grid.claim(2, 0, 0, 0)  # net 2 overuses the first cell (place() would raise)
+    assert grid.occupancy_at(0, 0, 0) == 2
+    assert grid.overused() == [(0, 0, 0)]
+    assert grid.route_of(1) == frozenset({(0, 0, 0), (1, 0, 0)})
+
+    grid.rip_up_net(1)
+    assert grid.occupancy_at(0, 0, 0) == 1
+    assert grid.occupancy_at(1, 0, 0) == 0
+    assert grid.overused() == []
+    assert grid.route_of(1) == frozenset()
+
+
+def test_claim_refuses_blocked_cells() -> None:
+    grid = Grid()
+    grid.place(0, 0, 0, owner=1)  # component body
+    with pytest.raises(CompileError):
+        grid.claim(9, 0, 0, 0)
+
+
+def test_history_accumulates_only_on_overused_cells() -> None:
+    grid = Grid()
+    grid.claim(1, 0, 0, 0)
+    grid.claim(2, 0, 0, 0)  # overused
+    before = grid.routing_cost(0, 0, 0)
+    grid.add_history()  # one negotiation iteration
+    assert grid.routing_cost(0, 0, 0) > before  # permanently pricier now
+    assert grid.history_at(0, 0, 0) > 0.0
+
+    # A cell that was never overused gains no history.
+    grid.claim(3, 5, 5, 5)
+    grid.add_history()
+    assert grid.history_at(5, 5, 5) == 0.0
