@@ -12,6 +12,7 @@ dependencies = [
     "nbtlib>=2.0.4",
     "networkx>=3.7",
     "numpy>=2.5.3",
+    "pyyaml>=6.0.3",
     "typer>=0.27.2",
 ]
 

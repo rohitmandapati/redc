@@ -170,3 +170,12 @@ class PrimitiveGate(Component):
 @dataclass(frozen=True)
 class Wiring(Component):
     """A signal-carrying passthrough: a buffer/repeater the router may insert."""
+
+@dataclass(frozen=True)
+class TypeCast(Component):
+    """Takes a data type and casts it to another size, e.g. 32-bit -> 8-hex
+        or uint8 -> uint4 (truncate and drop msb)"""
+    
+@dataclass(frozen=True)
+class Register(Component):
+    """Stores a specified amount of bits to keep state and has a 'done' signal"""
