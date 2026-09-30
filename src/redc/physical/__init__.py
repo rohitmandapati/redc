@@ -19,6 +19,7 @@ from .components import (
     Wiring,
 )
 from .grid import EMPTY, MAX_HEIGHT, CellKind, Grid
+from .netlist import ComponentInstance, Net, PhysicalNetlist, Terminal
 
 __all__ = [
     "EMPTY",
@@ -34,17 +35,21 @@ __all__ = [
     "Clock",
     "ClockSource",
     "Component",
+    "ComponentInstance",
     "Constant",
     "Face",
     "Grid",
     "InputPad",
     "Library",
+    "Net",
     "Operation",
     "OutputPad",
+    "PhysicalNetlist",
     "Port",
     "PortDir",
     "PrimitiveGate",
     "Register",
+    "Terminal",
     "TypeCast",
     "Wiring",
 ]
