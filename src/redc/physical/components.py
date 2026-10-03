@@ -3,30 +3,50 @@
 A :class:`Component` is a *definition* (like a standard cell in an ASIC flow),
 not a placed instance.  It knows its own shape and timing but nothing about
 *where* it sits -- placement supplies an origin later and resolves each port's
-local ``offset`` into an absolute grid coordinate.
+local ``offset`` into an absolute grid coordinate.  Per-instance data (a
+register's reset value) lives on :class:`~redc.physical.netlist.ComponentInstance`.
 
 Every component carries:
 
-* ``latency`` -- combinational delay in *ticks*.  ``0`` means purely
-  combinational; ``> 0`` means the cell holds a result across ticks.  This is the
-  physical-layer reflection of RedC's combinational-first principle: state is
-  explicit, never inferred.
+* ``latency`` -- physical *propagation delay* in redstone ticks, or ``None``
+  when it is not yet known (a stub with no measured circuit).  It says nothing
+  about state: a NOT gate is combinational with ``latency == 1``, an adder is
+  combinational with several ticks of delay, and a zero-tick adder is
+  combinational with ``latency == 0``.
+* :attr:`~Component.is_stateful` / :attr:`~Component.is_combinational` -- the
+  independent "does this cell hold state?" property.  Only :class:`Register` is
+  stateful, and only stateful cells attach to the global clock and reset.
 * ``dim`` -- the cell's footprint in occupancy-grid cells, ``(dx, dy, dz)``,
   with ``y`` up to match :mod:`redc.physical.grid`.
 * ``inputs`` / ``outputs`` -- typed :class:`Port` pins.  Each pin names the
   ``face`` it lives on and its ``offset`` within the footprint, so the router
-  knows both where a net must reach and which direction it enters from.
+  knows both where a net must reach and which direction it enters from.  Every
+  pin type must be a supported Minecraft physical type
+  (:mod:`redc.physical.signals`).  Input declaration order is the canonical IR
+  operand order, so a mapper can pair ``zip(node args, operand_inputs)``.
 
-This module defines the data model *and* each cell's functional ``behavior``: the
-base :class:`Component`; the datapath families :class:`Operation`,
-:class:`PrimitiveGate`, :class:`Wiring`, :class:`TypeCast` and :class:`Register`;
-and the :class:`Boundary` cells (:class:`InputPad`, :class:`OutputPad`,
-:class:`Constant`, :class:`ClockSource`) that join the fabric to the outside
-world.  A :class:`Clock` describes the single domain every register shares.
-Concrete cells are subclasses that pin down every field, named by convention, e.g.
-``uint8_add_a-0-1-1_b-0-1-0_out-0-0-0`` -- datatype, op, then each pin's offset.
-There are enough such variants (differing pin offsets, datatypes) for the router
-to choose a layout that fits its situation.
+Operation-implementing cells report their exact
+:class:`~redc.physical.implementation.OperationSignature` via
+:meth:`Component.signatures`; that is how the
+:class:`~redc.physical.cells.Library` indexes them (full type identity, never
+width alone).
+
+This module defines the data model *and* each cell's functional ``behavior``.
+The families fall into four categories:
+
+* compute -- :class:`Operation`, :class:`PrimitiveGate`, :class:`TypeCast`,
+  :class:`Register` (the only ones with operation signatures);
+* routing / timing -- :class:`Wiring`;
+* logical / control boundaries -- the :class:`Boundary` cells
+  (:class:`InputPad`, :class:`OutputPad`, :class:`Constant`,
+  :class:`ClockSource`, :class:`ResetSource`): abstract, built on demand;
+* physical user interfaces -- :class:`Peripheral`: real Minecraft devices
+  (levers, displays, ...) with their own geometry, loaded from YAML.
+  A :class:`Clock` describes the single global
+domain every register shares.  Concrete cells are named by convention, e.g.
+``uint8_add_a-0-0-0_b-0-0-1_out-0-0-2`` -- datatype, op, then each pin's
+offset -- and a signature may have several layout variants for the router to
+choose from.
 """
 
 from __future__ import annotations
@@ -35,8 +55,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 
-from ..ir import BOOL, IRType, _calculate
+from ..ir import BOOL, OPS, IRType, _calculate
 from ..parser import CompileError
+from .implementation import REGISTER_OP, OperationSignature
+from .signals import require_supported_physical_type
 
 
 class Face(Enum):
@@ -93,10 +115,13 @@ class Port:
 
 @dataclass(frozen=True)
 class Component:
-    """A placeable cell definition with a footprint, timing, and typed pins."""
+    """A placeable cell definition with a footprint, timing, and typed pins.
+
+    ``latency`` is propagation delay in ticks (``None`` = unknown) and is
+    independent of :attr:`is_combinational` (see the module docstring)."""
 
     name: str
-    latency: int
+    latency: int | None
     dim: tuple[int, int, int]
     inputs: tuple[Port, ...]
     outputs: tuple[Port, ...]
@@ -105,14 +130,18 @@ class Component:
     nbt: str | None = None
 
     def __post_init__(self) -> None:
-        if self.latency < 0:
+        if self.latency is not None and self.latency < 0:
             raise CompileError(f"{self.name}: latency must be non-negative")
         if any(d <= 0 for d in self.dim):
             raise CompileError(f"{self.name}: dimensions must be positive, got {self.dim}")
+        names = [port.name for port in self.ports]
+        if len(set(names)) != len(names):
+            raise CompileError(f"{self.name}: duplicate pin names {names}")
         for port in self.ports:
             self._check_port(port)
 
     def _check_port(self, port: Port) -> None:
+        require_supported_physical_type(port.dtype, f"{self.name}: pin {port.name!r}")
         # The pin must sit inside the footprint...
         for o, d in zip(port.offset, self.dim):
             if not 0 <= o < d:
@@ -134,8 +163,15 @@ class Component:
         return self.inputs + self.outputs
 
     @property
+    def is_stateful(self) -> bool:
+        """True for cells that hold state across clock ticks (registers).  Only
+        stateful cells need the global clock and reset."""
+        return False
+
+    @property
     def is_combinational(self) -> bool:
-        return self.latency == 0
+        """True for cells with no stored state, whatever their ``latency``."""
+        return not self.is_stateful
 
     @property
     def volume(self) -> int:
@@ -157,11 +193,6 @@ class Component:
         return max((port.dtype.width for port in self.ports), default=0)
 
     @property
-    def is_stateful(self) -> bool:
-        """True for cells that hold state across clock ticks (registers)."""
-        return False
-
-    @property
     def is_source(self) -> bool:
         """True for cells that originate a value with no fabric input."""
         return False
@@ -177,12 +208,34 @@ class Component:
     def output_port(self, name: str) -> Port | None:
         return next((p for p in self.outputs if p.name == name), None)
 
-    def index_keys(self) -> frozenset[tuple[str, int]]:
-        """``(op-or-kind, width)`` keys the cell
-        :class:`~redc.physical.cells.Library` files this cell under, so tech-map
-        can resolve an IR node to candidate variants.  Empty for cells not
-        chosen by operation (wiring, boundary)."""
-        return frozenset()
+    def port(self, name: str) -> Port:
+        """The pin called ``name``; raises if the cell has none."""
+        port = self.input_port(name) or self.output_port(name)
+        if port is None:
+            raise CompileError(f"{self.name}: no pin {name!r}")
+        return port
+
+    @property
+    def operand_inputs(self) -> tuple[Port, ...]:
+        """Input pins that carry IR operands, in IR argument order.  For most
+        cells that is every input; a :class:`Register` excludes ``clk``/``rst``."""
+        return self.inputs
+
+    def signatures(self) -> tuple[OperationSignature, ...]:
+        """Exact-typed operations this cell implements directly -- the keys the
+        :class:`~redc.physical.cells.Library` files it under.  Empty for cells
+        not chosen by operation (wiring, boundary)."""
+        return ()
+
+    def _signature(self, op: str) -> OperationSignature:
+        if len(self.outputs) != 1:
+            raise CompileError(f"{self.name}: an operation cell has exactly one output")
+        try:
+            return OperationSignature(
+                op, self.outputs[0].dtype, tuple(p.dtype for p in self.operand_inputs)
+            )
+        except CompileError as exc:
+            raise CompileError(f"{self.name}: {exc}") from exc
 
     def behavior(self, inputs: Mapping[str, int]) -> dict[str, int]:
         """Pure functional model: given a value on each input pin (raw unsigned
@@ -193,14 +246,14 @@ class Component:
         evaluation, which is how placement/routing get verified before any
         redstone exists.  Combinational cells implement this; stateful cells
         (:class:`Register`) use :meth:`~Register.read`/:meth:`~Register.step`;
-        externally-driven sources (input pads, the clock) are fed by the
+        externally-driven sources (input pads, clock, reset) are fed by the
         simulator harness and never reach here."""
         raise NotImplementedError(f"{type(self).__name__} has no pure behavior")
 
     def _args(self, inputs: Mapping[str, int]) -> list[int]:
-        """Input-pin values in declared order, for feeding an op evaluator."""
+        """Operand-pin values in declared order, for feeding an op evaluator."""
         try:
-            return [inputs[port.name] for port in self.inputs]
+            return [inputs[port.name] for port in self.operand_inputs]
         except KeyError as exc:
             raise CompileError(
                 f"{self.name}: missing value for input pin {exc.args[0]!r}"
@@ -208,15 +261,11 @@ class Component:
 
 
 # --------------------------------------------------------------------------
-# Datapath families.  Concrete cells subclass one of these and fix every field
-# (see the module docstring's naming convention); each supplies its functional
-# model via :meth:`Component.behavior`.
+# Datapath families.  Concrete cells fix every field (see the module
+# docstring's naming convention); each supplies its functional model via
+# :meth:`Component.behavior`, delegating arithmetic to the IR evaluator so there
+# is exactly one definition of RedC semantics.
 # --------------------------------------------------------------------------
-
-#: Operations whose result is a bool regardless of operand width.  They are
-#: indexed by *operand* width -- what the datapath actually carries -- not by
-#: their 1-bit output, so tech-map can find a comparator for an 8-bit compare.
-COMPARISONS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 
 
 @dataclass(frozen=True)
@@ -224,11 +273,19 @@ class Operation(Component):
     """A multi-bit datapath operator (add, sub, mux, shift, compare, ...).
 
     ``behavior`` defers to the IR's own operation semantics, so a placed adder
-    computes exactly what the ``add`` node it was mapped from would.  Input pins
+    computes exactly what the ``add`` node it was mapped from would -- including
+    signed comparison, division, modulo and arithmetic right shift.  Input pins
     MUST be declared in the operation's canonical argument order (mux = select,
-    then the two operands; shifts = value, then amount)."""
+    then the two operands; shifts = value, then the ``uint64`` amount); the
+    signature check rejects anything the IR typing rules would."""
 
     op: str = ""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.op not in OPS or self.op == "cast":
+            raise CompileError(f"{self.name}: {self.op!r} is not an IR datapath op")
+        self._signature(self.op)
 
     def behavior(self, inputs: Mapping[str, int]) -> dict[str, int]:
         out = self.outputs[0]
@@ -237,54 +294,51 @@ class Operation(Component):
         )
         return {out.name: value}
 
-    def index_keys(self) -> frozenset[tuple[str, int]]:
-        width = (
-            self.inputs[0].dtype.width
-            if self.op in COMPARISONS
-            else self.outputs[0].dtype.width
-        )
-        return frozenset({(self.op, width)})
+    def signatures(self) -> tuple[OperationSignature, ...]:
+        return (self._signature(self.op),)
+
+
+#: Gates computed as the bitwise complement of an IR operation.
+_NEGATED_GATES = {"nand": "and", "nor": "or", "xnor": "xor"}
 
 
 @dataclass(frozen=True)
 class PrimitiveGate(Component):
-    """A boolean gate (and, or, not, xor, nand, nor, xnor), applied bitwise."""
+    """A boolean gate (and, or, not, inv, xor, nand, nor, xnor), applied bitwise.
+
+    Gates named after IR operations share the IR's semantics and typing (``not``
+    is logical negation, so it only exists on ``bool``); ``nand``/``nor``/
+    ``xnor`` are the complements of ``and``/``or``/``xor``."""
 
     op: str = ""
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if _NEGATED_GATES.get(self.op, self.op) not in {"and", "or", "xor", "not", "inv"}:
+            raise CompileError(f"{self.name}: unknown gate op {self.op!r}")
+        self._signature(self.op)
+
     def behavior(self, inputs: Mapping[str, int]) -> dict[str, int]:
         out = self.outputs[0]
-        args = self._args(inputs)
-        op = self.op
-        if op == "and":
-            value = args[0] & args[1]
-        elif op == "or":
-            value = args[0] | args[1]
-        elif op == "xor":
-            value = args[0] ^ args[1]
-        elif op == "nand":
-            value = ~(args[0] & args[1])
-        elif op == "nor":
-            value = ~(args[0] | args[1])
-        elif op == "xnor":
-            value = ~(args[0] ^ args[1])
-        elif op in {"not", "inv"}:
-            value = ~args[0]
-        else:
-            raise CompileError(f"{self.name}: unknown gate op {op!r}")
-        return {out.name: value & out.dtype.mask}
+        base = _NEGATED_GATES.get(self.op, self.op)
+        value = _calculate(
+            base, self._args(inputs), out.dtype, [p.dtype for p in self.inputs]
+        )
+        if self.op in _NEGATED_GATES:
+            value = ~value & out.dtype.mask
+        return {out.name: value}
 
-    def index_keys(self) -> frozenset[tuple[str, int]]:
-        return frozenset({(self.op, self.outputs[0].dtype.width)})
+    def signatures(self) -> tuple[OperationSignature, ...]:
+        return (self._signature(self.op),)
 
 
 @dataclass(frozen=True)
 class Wiring(Component):
     """A signal-carrying passthrough: a buffer/repeater the router may insert.
 
-    Functionally the identity (output == input); its reason to exist is timing
-    and reach -- a nonzero ``latency`` is the matched delay / repeater the router
-    inserts to close timing (see the timing model)."""
+    Functionally the identity (output == input) and combinational; its reason to
+    exist is timing and reach -- its nonzero ``latency`` is the matched delay /
+    repeater the router inserts to close timing (see the timing model)."""
 
     def behavior(self, inputs: Mapping[str, int]) -> dict[str, int]:
         out = self.outputs[0]
@@ -293,76 +347,195 @@ class Wiring(Component):
 
 @dataclass(frozen=True)
 class TypeCast(Component):
-    """Resize/reinterpret a value from one datatype to another: e.g. uint8 ->
-    uint4 truncates the high bits, and a widening cast sign- or zero-extends per
-    the source type.  Indexed by its ``(source_width, result_width)`` pair."""
+    """Convert a value from one datatype to another with exact IR ``cast``
+    semantics: widening sign-extends a signed source and zero-extends an
+    unsigned one, narrowing truncates to the destination width, ``-> bool`` is
+    ``value != 0`` and ``bool ->`` yields 0 or 1.  A cast is not merely a wire
+    width change, so it is identified by its FULL source and result types
+    (``int8 -> uint16`` and ``uint8 -> uint16`` are different cells)."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if len(self.inputs) != 1:
+            raise CompileError(f"{self.name}: a cast has exactly one input")
+        self._signature("cast")
 
     def behavior(self, inputs: Mapping[str, int]) -> dict[str, int]:
         src, dst = self.inputs[0], self.outputs[0]
-        value = _calculate("cast", [inputs[src.name]], dst.dtype, [src.dtype])
+        value = _calculate("cast", self._args(inputs), dst.dtype, [src.dtype])
         return {dst.name: value}
 
-    @property
-    def source_width(self) -> int:
-        return self.inputs[0].dtype.width
+    def signatures(self) -> tuple[OperationSignature, ...]:
+        return (self._signature("cast"),)
 
     @property
-    def result_width(self) -> int:
-        return self.outputs[0].dtype.width
+    def source_type(self) -> IRType:
+        return self.inputs[0].dtype
+
+    @property
+    def result_type(self) -> IRType:
+        return self.outputs[0].dtype
 
 
 @dataclass(frozen=True)
 class Register(Component):
     """A state element: the physical realization of an IR ``register`` node.
 
-    It exposes four pins -- ``next`` (the value to latch), ``enable`` (latch only
-    when high), ``clk`` (the global clock net; the ONLY place the clock attaches,
-    per the timing model) and ``out`` (the value currently held).  Being
-    *stateful* it has no pure ``behavior``; the simulator uses :meth:`initial`,
-    :meth:`read` and :meth:`step`, mirroring how the IR evaluates registers over
-    ticks (:meth:`redc.ir.Graph.run`).  ``init`` is the reset value."""
+    A register *definition* describes how a register works; it does NOT own a
+    reset value.  The value loaded on reset belongs to each instance
+    (``ComponentInstance.init``), so registers with different initial values
+    share one definition.
 
-    init: int = 0
+    Pins, in declaration order:
+
+    * ``next``   -- value to latch (operand 0 of the IR node);
+    * ``enable`` -- ``bool``; latch ``next`` on a clock edge only when high
+      (operand 1 of the IR node);
+    * ``clk``    -- ``bool``; the single global clock net, the ONLY place the
+      clock attaches (per the timing model);
+    * ``rst``    -- ``bool``; the single global reset net, active high and
+      asynchronous like the SystemVerilog backend's ``posedge rst``;
+    * ``out``    -- the value currently held.
+
+    Reset has priority over enable: while ``rst`` is high the state is the
+    instance's ``init``; otherwise on a clock edge the state becomes ``next`` if
+    ``enable`` else holds.  Being stateful it has no pure ``behavior``; the
+    simulator uses :meth:`reset_value`, :meth:`read` and :meth:`step`, mirroring
+    :meth:`redc.ir.Graph.reset_state` / :meth:`redc.ir.Graph.step`."""
 
     NEXT = "next"
     ENABLE = "enable"
     CLOCK = "clk"
+    RESET = "rst"
     OUT = "out"
+    PINS = (NEXT, ENABLE, CLOCK, RESET)
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        for name in (self.NEXT, self.ENABLE, self.CLOCK):
-            if self.input_port(name) is None:
-                raise CompileError(f"{self.name}: register missing input pin {name!r}")
-        if self.output_port(self.OUT) is None:
-            raise CompileError(f"{self.name}: register missing output pin {self.OUT!r}")
-        for name in (self.ENABLE, self.CLOCK):
-            if self.input_port(name).dtype.width != 1:
-                raise CompileError(f"{self.name}: register {name!r} pin must be one bit")
+        if tuple(p.name for p in self.inputs) != self.PINS:
+            raise CompileError(
+                f"{self.name}: register inputs must be exactly {list(self.PINS)} "
+                f"in that order, got {[p.name for p in self.inputs]}"
+            )
+        if tuple(p.name for p in self.outputs) != (self.OUT,):
+            raise CompileError(f"{self.name}: register must have one output {self.OUT!r}")
+        for name in (self.ENABLE, self.CLOCK, self.RESET):
+            if self.port(name).dtype != BOOL:
+                raise CompileError(f"{self.name}: register {name!r} pin must be bool")
+        if self.port(self.NEXT).dtype != self.data_type:
+            raise CompileError(f"{self.name}: register next/out types differ")
+        self._signature(REGISTER_OP)
 
     @property
     def is_stateful(self) -> bool:
         return True
 
     @property
+    def operand_inputs(self) -> tuple[Port, ...]:
+        return (self.port(self.NEXT), self.port(self.ENABLE))
+
+    @property
+    def data_type(self) -> IRType:
+        return self.port(self.OUT).dtype
+
+    @property
     def data_width(self) -> int:
-        return self.output_port(self.OUT).dtype.width
+        return self.data_type.width
 
-    def index_keys(self) -> frozenset[tuple[str, int]]:
-        return frozenset({("register", self.data_width)})
+    def signatures(self) -> tuple[OperationSignature, ...]:
+        return (self._signature(REGISTER_OP),)
 
-    def initial(self) -> int:
-        """The reset value the register loads (its IR ``init``)."""
-        return self.output_port(self.OUT).dtype.bits(self.init)
+    def check_init(self, init: int) -> int:
+        """Validate an instance reset value against the data type and return its
+        raw bits.  Accepts a raw bit pattern (``0 .. 2**w - 1``) or, for signed
+        types, a negative two's-complement number (``-2**(w-1) .. -1``)."""
+        typ = self.data_type
+        low = -(1 << (typ.width - 1)) if typ.signed else 0
+        if isinstance(init, bool) or not isinstance(init, int) or not low <= init <= typ.mask:
+            raise CompileError(
+                f"{self.name}: register init {init!r} does not fit {typ.name}"
+            )
+        return typ.bits(init)
+
+    def reset_value(self, init: int) -> int:
+        """The state held while ``rst`` is asserted: the instance's ``init``."""
+        return self.check_init(init)
 
     def read(self, state: int) -> dict[str, int]:
         """The combinational view: the ``out`` pin exposes the stored value."""
-        return {self.OUT: self.output_port(self.OUT).dtype.bits(state)}
+        return {self.OUT: self.data_type.bits(state)}
 
-    def step(self, state: int, inputs: Mapping[str, int]) -> int:
-        """The next stored value on a clock edge: latch ``next`` iff enabled."""
-        mask = self.output_port(self.OUT).dtype.mask
+    def step(self, state: int, inputs: Mapping[str, int], *, init: int) -> int:
+        """The next stored value: ``init`` under reset (reset wins over enable),
+        else on a clock edge latch ``next`` iff ``enable``, else hold."""
+        if inputs.get(self.RESET, 0):
+            return self.reset_value(init)
+        mask = self.data_type.mask
         return (inputs[self.NEXT] & mask) if inputs[self.ENABLE] else (state & mask)
+
+
+# --------------------------------------------------------------------------
+# Physical user interfaces.
+# --------------------------------------------------------------------------
+
+
+class PeripheralDirection(Enum):
+    """Which way a peripheral moves a value across the design boundary."""
+
+    INPUT = "input"  # Minecraft device -> internal net (lever, button, ...)
+    OUTPUT = "output"  # internal net -> Minecraft device (lamp, display, ...)
+
+
+@dataclass(frozen=True)
+class Peripheral(Component):
+    """A real Minecraft-facing interface device at the design boundary.
+
+    Unlike the abstract :class:`Boundary` pads, a peripheral is an actual
+    structure with geometry the placer must make room for.  It is NOT a compute
+    cell: it has no operation signature and never appears as an implementation
+    candidate.  ``kind`` names the interface (``"lever"``, ``"2-dig-7-seg"``,
+    ...).  An INPUT peripheral has no inputs and one output pin that sources a
+    value into the netlist; an OUTPUT peripheral has one input pin and no
+    outputs.  Its terminals obey the ordinary netlist rules (exact types, one
+    driver)."""
+
+    kind: str = ""
+    direction: PeripheralDirection | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.kind:
+            raise CompileError(f"{self.name}: a peripheral needs a kind")
+        if self.direction is PeripheralDirection.INPUT:
+            if self.inputs or len(self.outputs) != 1:
+                raise CompileError(
+                    f"{self.name}: an input peripheral has no inputs and one output"
+                )
+        elif self.direction is PeripheralDirection.OUTPUT:
+            if self.outputs or len(self.inputs) != 1:
+                raise CompileError(
+                    f"{self.name}: an output peripheral has one input and no outputs"
+                )
+        else:
+            raise CompileError(f"{self.name}: a peripheral needs a direction")
+
+    @property
+    def dtype(self) -> IRType:
+        """The logical datatype the device carries."""
+        return self.ports[0].dtype
+
+    @property
+    def is_source(self) -> bool:
+        return self.direction is PeripheralDirection.INPUT
+
+    @property
+    def is_sink(self) -> bool:
+        return self.direction is PeripheralDirection.OUTPUT
+
+    def behavior(self, inputs: Mapping[str, int]) -> dict[str, int]:
+        if self.is_sink:
+            return {}
+        return super().behavior(inputs)  # driven by the stimulus, like InputPad
 
 
 # --------------------------------------------------------------------------
@@ -373,6 +546,14 @@ class Register(Component):
 @dataclass(frozen=True)
 class Clock:
     """The single, global clock domain every :class:`Register` shares.
+
+    v1 invariant: one sequential PhysicalNetlist == one clock domain == one
+    :class:`ClockSource` whose single net reaches every register ``clk`` pin
+    (and one :class:`ResetSource` whose single net reaches every ``rst`` pin).
+    There are no per-register, per-FSM or per-region clocks: independent
+    Minecraft clock generators drift out of phase (chunks load at different
+    times), so all state shares one generator and skew is a later
+    clock-routing/timing concern.
 
     ``period`` stays ``None`` until static timing analysis measures the placed
     critical path and sets it (the timing model closes timing post-route, in the
@@ -387,7 +568,8 @@ class Clock:
 @dataclass(frozen=True)
 class Boundary(Component):
     """Base for cells at the edge of the design -- the pins where signals enter
-    or leave the fabric, hardwired constants, and the clock generator.
+    or leave the fabric, hardwired constants, and the global clock and reset
+    sources.
 
     Unlike the datapath families these are *parametric per instance* (a constant
     carries a value, a pad carries a signal name), so the tech-mapper builds them
@@ -453,7 +635,7 @@ class Constant(Boundary):
     @classmethod
     def of(cls, value: int, dtype: IRType, *, face: Face = Face.EAST) -> Constant:
         return cls(
-            name=f"const_{dtype.width}b_{dtype.bits(value)}",
+            name=f"const_{dtype.name}_{dtype.bits(value)}",
             latency=0,
             dim=(1, 1, 1),
             inputs=(),
@@ -472,9 +654,9 @@ class Constant(Boundary):
 
 @dataclass(frozen=True)
 class ClockSource(Boundary):
-    """The generator that drives the clock net feeding every register's ``clk``
-    pin.  One 1-bit output; ``period`` is set post-route (see :class:`Clock`).
-    The simulator toggles it, so it has no ``behavior``."""
+    """The one global clock generator; its single net feeds every register's
+    ``clk`` pin.  One 1-bit output; ``period`` is set post-route (see
+    :class:`Clock`).  The simulator toggles it, so it has no ``behavior``."""
 
     period: int | None = None
 
@@ -487,6 +669,27 @@ class ClockSource(Boundary):
             inputs=(),
             outputs=(Port("clk", BOOL, face, (0, 0, 0), PortDir.OUT),),
             period=period,
+        )
+
+    @property
+    def is_source(self) -> bool:
+        return True
+
+
+@dataclass(frozen=True)
+class ResetSource(Boundary):
+    """The one global reset driver: a 1-bit, active-high source whose single net
+    feeds every register's ``rst`` pin (the physical twin of the SystemVerilog
+    ``rst`` port).  The simulator drives it, so it has no ``behavior``."""
+
+    @classmethod
+    def of(cls, *, face: Face = Face.EAST) -> ResetSource:
+        return cls(
+            name="rst_source",
+            latency=0,
+            dim=(1, 1, 1),
+            inputs=(),
+            outputs=(Port("rst", BOOL, face, (0, 0, 0), PortDir.OUT),),
         )
 
     @property

@@ -16,21 +16,36 @@ Storage is asymmetric, mirroring a real Minecraft world:
   coordinates are supported via an origin offset.  Callers only ever see virtual
   coordinates; the capacity and origin are private implementation details.
 
-Per-cell data is kept as a structure-of-arrays so numpy stays vectorizable and
-the routing cost fields can be added later without disturbing occupancy:
+Per-cell data is kept as a structure-of-arrays so numpy stays vectorizable.  The
+grid serves two regimes with different rules:
 
-* ``owner`` -- id of the component or net occupying the cell (``EMPTY`` if free).
+*Placement* is strict -- one owner per cell, :meth:`place` raises on conflict:
+
+* ``owner`` -- id of the component (or committed net) in the cell (``EMPTY`` if
+  free).
 * ``kind``  -- what *sort* of thing occupies it (see :class:`CellKind`).
 
-All mutation goes through :meth:`place`, :meth:`reserve` and :meth:`rip_up` so
-that every change to the environment is a single call that can later be logged as
-an event for the place-and-route replay trace.
+*Routing* is negotiated -- nets may temporarily *share* cells and are driven
+apart by rising cost.  It rides two more arrays plus a per-net index:
+
+* ``occupancy`` -- how many nets currently route through the cell (present
+  congestion); a legal routing has at most :data:`CAPACITY` per cell.
+* ``history``   -- congestion accumulated across iterations; the permanent
+  memory that makes negotiated-congestion converge instead of oscillate.
+
+A bus of any width is one net occupying one path of cells (width lives on the
+net, not the grid) -- so these arrays stay scalar and width-agnostic.
+
+Placement mutation goes through :meth:`place`/:meth:`reserve`/:meth:`rip_up`;
+routing through :meth:`claim`/:meth:`rip_up_net`.  Every change is a single call
+that can be logged as an event for the place-and-route replay trace.
 """
 
 from __future__ import annotations
 
-from enum import IntEnum
+import math
 from collections.abc import Iterator
+from enum import IntEnum
 
 import numpy as np
 
@@ -45,6 +60,26 @@ MAX_HEIGHT = 24
 #: Default horizontal caps -- effectively unbounded.  A compiler flag can lower
 #: these to constrain how wide/deep a generated circuit is allowed to grow.
 DEFAULT_MAX_HORIZONTAL = 1 << 30
+
+#: Negotiated-congestion routing knobs.  A routable cell costs ``BASE_COST``; a
+#: cell shared by more than ``CAPACITY`` nets is *overused* and penalised.
+#: ``PRESENT_FACTOR`` (raised by the router across iterations) scales the
+#: present-overuse penalty; ``HISTORY_INCREMENT`` scales how fast the permanent
+#: history term accrues.
+BASE_COST = 1.0
+CAPACITY = 1
+PRESENT_FACTOR = 0.5
+HISTORY_INCREMENT = 1.0
+
+#: The six axis-aligned moves a wire may take (redstone has no diagonals).
+_MOVES = (
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+)
 
 
 class CellKind(IntEnum):
@@ -96,6 +131,11 @@ class Grid:
 
         self._owner = self._new_owner(0, 0)
         self._kind = self._new_kind(0, 0)
+        # Routing layer: present occupancy + accumulated history, and the per-net
+        # cell index that makes whole-net rip-up O(net length).
+        self._history = self._new_history(0, 0)
+        self._occupancy = self._new_occupancy(0, 0)
+        self._net_cells: dict[int, set[tuple[int, int, int]]] = {}
 
     # -- allocation helpers ------------------------------------------------
 
@@ -104,6 +144,12 @@ class Grid:
 
     def _new_kind(self, nx: int, nz: int) -> np.ndarray:
         return np.full((nx, self.height, nz), CellKind.FREE, dtype=np.uint8)
+
+    def _new_history(self, nx: int, nz: int) -> np.ndarray:
+        return np.zeros((nx, self.height, nz), dtype=np.float32)
+
+    def _new_occupancy(self, nx: int, nz: int) -> np.ndarray:
+        return np.zeros((nx, self.height, nz), dtype=np.int32)
 
     def _check_y(self, y: int) -> None:
         if not 0 <= y < self.height:
@@ -128,6 +174,17 @@ class Grid:
                 f"exceeding max_z={self.max_z}"
             )
 
+    def _horizontal_ok(self, x: int, z: int) -> bool:
+        """Whether using ``(x, z)`` stays within the span caps (predicate form of
+        :meth:`_check_horizontal`, for neighbour enumeration -- never raises)."""
+        lo_x = x if self._used_min_x is None else min(self._used_min_x, x)
+        hi_x = x if self._used_max_x is None else max(self._used_max_x, x)
+        if hi_x - lo_x + 1 > self.max_x:
+            return False
+        lo_z = z if self._used_min_z is None else min(self._used_min_z, z)
+        hi_z = z if self._used_max_z is None else max(self._used_max_z, z)
+        return hi_z - lo_z + 1 <= self.max_z
+
     def _extend_used(self, x: int, z: int) -> None:
         self._used_min_x = x if self._used_min_x is None else min(self._used_min_x, x)
         self._used_max_x = x if self._used_max_x is None else max(self._used_max_x, x)
@@ -142,6 +199,8 @@ class Grid:
             self._nx = self._nz = 1
             self._owner = self._new_owner(1, 1)
             self._kind = self._new_kind(1, 1)
+            self._history = self._new_history(1, 1)
+            self._occupancy = self._new_occupancy(1, 1)
             return
 
         px, pz = x - self._ox, z - self._oz
@@ -167,14 +226,20 @@ class Grid:
 
         owner = self._new_owner(new_nx, new_nz)
         kind = self._new_kind(new_nx, new_nz)
+        history = self._new_history(new_nx, new_nz)
+        occupancy = self._new_occupancy(new_nx, new_nz)
 
         # Copy the old contents into their new location.
         dx = self._ox - new_ox
         dz = self._oz - new_oz
-        owner[dx : dx + self._nx, :, dz : dz + self._nz] = self._owner
-        kind[dx : dx + self._nx, :, dz : dz + self._nz] = self._kind
+        window = (slice(dx, dx + self._nx), slice(None), slice(dz, dz + self._nz))
+        owner[window] = self._owner
+        kind[window] = self._kind
+        history[window] = self._history
+        occupancy[window] = self._occupancy
 
         self._owner, self._kind = owner, kind
+        self._history, self._occupancy = history, occupancy
         self._ox, self._oz = new_ox, new_oz
         self._nx, self._nz = new_nx, new_nz
 
@@ -226,6 +291,106 @@ class Grid:
     def rip_up(self, x: int, y: int, z: int) -> None:
         """Free a cell.  The core primitive negotiated-congestion routing needs."""
         self._write(x, y, z, EMPTY, CellKind.FREE)
+
+    # -- routing: moves, cost, negotiated congestion -----------------------
+
+    def is_routable(self, x: int, y: int, z: int) -> bool:
+        """Whether a net may pass through this cell.  Component bodies, pins and
+        permanent obstacles block routing; free space and existing wire segments
+        are fair game -- wires *may* be shared, and resolving that overuse is
+        exactly what negotiated-congestion routing does."""
+        if not 0 <= y < self.height:
+            return False
+        return self.kind_at(x, y, z) in (CellKind.FREE, CellKind.WIRE)
+
+    def neighbors(self, x: int, y: int, z: int) -> Iterator[tuple[int, int, int]]:
+        """The routable six-connected cells adjacent to ``(x, y, z)`` -- the legal
+        one-step wire moves out of it.  A neighbour is yielded only if it is in
+        bounds, within the span caps, and :meth:`is_routable`."""
+        for dx, dy, dz in _MOVES:
+            nx, ny, nz = x + dx, y + dy, z + dz
+            if self._horizontal_ok(nx, nz) and self.is_routable(nx, ny, nz):
+                yield (nx, ny, nz)
+
+    def routing_cost(
+        self, x: int, y: int, z: int, *, present_factor: float = PRESENT_FACTOR
+    ) -> float:
+        """Cost of routing a net through this cell.
+
+        Combines a base cost, the accumulated *history* congestion, and the
+        *present* overuse (nets sharing the cell beyond :data:`CAPACITY`).
+        Returns ``inf`` for cells a net may not use.  ``present_factor`` is
+        raised by the router across iterations so temporary sharing is squeezed
+        out."""
+        if not self.is_routable(x, y, z):
+            return math.inf
+        idx = self._index(x, y, z)
+        if idx is None:
+            return BASE_COST  # pristine free space: base cost only
+        overuse = max(0, int(self._occupancy[idx]) - CAPACITY)
+        return (BASE_COST + float(self._history[idx])) * (1.0 + present_factor * overuse)
+
+    def occupancy_at(self, x: int, y: int, z: int) -> int:
+        """How many nets currently route through the cell."""
+        idx = self._index(x, y, z)
+        return 0 if idx is None else int(self._occupancy[idx])
+
+    def history_at(self, x: int, y: int, z: int) -> float:
+        """The accumulated historical congestion on the cell."""
+        idx = self._index(x, y, z)
+        return 0.0 if idx is None else float(self._history[idx])
+
+    def route_of(self, net: int) -> frozenset[tuple[int, int, int]]:
+        """The set of cells ``net`` currently occupies."""
+        return frozenset(self._net_cells.get(net, ()))
+
+    def claim(self, net: int, x: int, y: int, z: int) -> None:
+        """Route ``net`` through a cell (negotiated-congestion working state).
+
+        Unlike :meth:`place`, this *allows overuse*: several nets may claim the
+        same cell at once, and the rising congestion cost is what later drives
+        them apart.  The claim is recorded per net so :meth:`rip_up_net` can undo
+        the whole route in one call."""
+        self._check_y(y)
+        self._check_horizontal(x, z)
+        if not self.is_routable(x, y, z):
+            raise CompileError(
+                f"cannot route net {net} through blocked cell ({x}, {y}, {z})"
+            )
+        self._ensure(x, z)
+        px, pz = x - self._ox, z - self._oz
+        self._occupancy[px, y, pz] += 1
+        self._net_cells.setdefault(net, set()).add((x, y, z))
+        self._extend_used(x, z)
+
+    def rip_up_net(self, net: int) -> None:
+        """Free every cell ``net`` routes through -- the whole-net counterpart to
+        :meth:`rip_up`, run each iteration before a net is rerouted against the
+        updated congestion costs."""
+        for x, y, z in self._net_cells.pop(net, set()):
+            idx = self._index(x, y, z)
+            if idx is not None:
+                self._occupancy[idx] = max(0, int(self._occupancy[idx]) - 1)
+
+    def overused(self) -> list[tuple[int, int, int]]:
+        """Every cell claimed by more nets than :data:`CAPACITY` -- the congestion
+        that must reach zero before a routing is legal."""
+        if self._nx == 0:
+            return []
+        xs, ys, zs = np.nonzero(self._occupancy > CAPACITY)
+        return [
+            (int(px) + self._ox, int(y), int(pz) + self._oz)
+            for px, y, pz in zip(xs.tolist(), ys.tolist(), zs.tolist())
+        ]
+
+    def add_history(self, *, increment: float = HISTORY_INCREMENT) -> None:
+        """Accumulate historical congestion on every overused cell -- called once
+        per router iteration.  This permanent memory is what makes negotiated-
+        congestion converge instead of oscillating between the same two routes."""
+        if self._nx == 0:
+            return
+        overuse = np.maximum(0, self._occupancy - CAPACITY).astype(np.float32)
+        self._history += increment * overuse
 
     # -- introspection / trace --------------------------------------------
 

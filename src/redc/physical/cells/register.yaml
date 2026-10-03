@@ -1,18 +1,24 @@
-# State-element cells.  Every register variant must expose four pins:
-#   next (data in), enable (bool), clk (bool, the clock net), out (data out).
+# State-element cells.  Every register variant exposes exactly five pins:
+#   next (data in), enable (bool), clk (bool, the global clock net),
+#   rst (bool, the global active-high reset net), out (data out).
+# A register definition does NOT carry a reset/init value: that belongs to each
+# ComponentInstance, so registers with different init values share one cell.
 # Key convention:  <datatype>_register_<pin>-<x>-<y>-<z>...
+# Geometry stubs: no Minecraft structure exists yet (nbt: null).
 family: register
-datatype: uint8          # family default for the data pins; control pins override
 
 variants:
-  uint8_register_next-0-0-0_enable-0-0-1_clk-0-0-2_out-0-0-2:
-    latency: 1
-    init: 0
+  "{t}_register_next-0-0-0_enable-0-0-1_clk-0-0-2_rst-0-0-1_out-0-0-2":
+    expand:
+      t: [bool, uint4, int4, uint8, int8, uint16, int16, uint32, int32, uint64, int64]
+    datatype: "{t}"      # data pins; control pins override with bool
+    latency: 1           # clock-to-out propagation delay, in ticks
     dim: [1, 1, 3]
-    nbt: uint8_register_next-0-0-0_enable-0-0-1_clk-0-0-2_out-0-0-2.nbt
+    nbt: null
     inputs:
       - {name: next, face: WEST, offset: [0, 0, 0]}
       - {name: enable, datatype: bool, face: WEST, offset: [0, 0, 1]}
       - {name: clk, datatype: bool, face: BOTTOM, offset: [0, 0, 2]}
+      - {name: rst, datatype: bool, face: BOTTOM, offset: [0, 0, 1]}
     outputs:
       - {name: out, face: EAST, offset: [0, 0, 2]}

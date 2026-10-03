@@ -17,6 +17,7 @@ register.  A graph that contains registers is *sequential*; one that does not is
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,11 +48,21 @@ class IRType:
         sign_bit = 1 << (self.width - 1)
         return bits - (1 << self.width) if self.signed and bits & sign_bit else bits
 
+    @property
+    def name(self) -> str:
+        """Source spelling of the type: ``bool``, ``uint8``, ``int16``, ..."""
+        if self.boolean:
+            return "bool"
+        return f"{'int' if self.signed else 'uint'}{self.width}"
+
     def to_dict(self) -> dict[str, int | bool]:
         return {"width": self.width, "signed": self.signed, "boolean": self.boolean}
 
 
 BOOL = IRType(1, boolean=True)
+
+#: Type of every shift-amount operand (operand 1 of ``shl``/``shr``).
+SHIFT_AMOUNT = IRType(64)
 
 
 def type_from_name(name: str) -> IRType | None:
@@ -99,6 +110,46 @@ OPS = {
     "gt",
     "ge",
 }
+
+COMPARISON_OPS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
+SHIFT_OPS = frozenset({"shl", "shr"})
+#: Operations whose operands and result all share one type.
+UNIFORM_OPS = frozenset(
+    {"add", "sub", "mul", "div", "mod", "and", "or", "xor", "neg", "inv"}
+)
+
+
+def arity(op: str) -> int:
+    """Operand count of an IR operation (``register`` counts next + enable)."""
+    if op in {"input", "const"}:
+        return 0
+    if op in {"cast", "not", "neg", "inv"}:
+        return 1
+    if op == "mux":
+        return 3
+    return 2
+
+
+def check_operation_types(op: str, typ: IRType, arg_types: Sequence[IRType]) -> None:
+    """The canonical typing rule for one IR operation.
+
+    Shared by :meth:`Graph.validate` and the physical layer's operation
+    signatures, so a physical cell can never claim a typing the IR would reject.
+    """
+    if op not in OPS:
+        raise CompileError(f"unknown IR operation {op}")
+    if len(arg_types) != arity(op):
+        raise CompileError(f"incorrect operand count for {op}")
+    if op == "mux" and not (arg_types[0] == BOOL and arg_types[1] == arg_types[2] == typ):
+        raise CompileError("mux type mismatch")
+    if op in COMPARISON_OPS and not (arg_types[0] == arg_types[1] and typ == BOOL):
+        raise CompileError("comparison type mismatch")
+    if op in SHIFT_OPS and not (arg_types[0] == typ and arg_types[1] == SHIFT_AMOUNT):
+        raise CompileError("shift type mismatch")
+    if op == "not" and not (arg_types[0] == typ == BOOL):
+        raise CompileError("logical negation type mismatch")
+    if op in UNIFORM_OPS and any(arg_type != typ for arg_type in arg_types):
+        raise CompileError("arithmetic type mismatch")
 
 
 def _calculate(op: str, args: list[int], typ: IRType, input_types: list[IRType]) -> int:
@@ -320,51 +371,20 @@ class Graph:
             elif any(arg < 0 or arg >= node["id"] for arg in node["args"]):
                 raise CompileError("cycle or invalid edge in combinational IR")
             typ = IRType(**node["type"])
-            arity = (
-                0
-                if op in {"input", "const"}
-                else 1
-                if op in {"cast", "not", "neg", "inv"}
-                else 3
-                if op == "mux"
-                else 2
-            )
-            if len(node["args"]) != arity:
-                raise CompileError(f"incorrect operand count for {op}")
             if op == "register":
+                if len(node["args"]) != 2:
+                    raise CompileError(f"incorrect operand count for {op}")
                 next_type = IRType(**self.nodes[node["args"][0]]["type"])
                 enable_type = IRType(**self.nodes[node["args"][1]]["type"])
                 if next_type != typ or enable_type != BOOL:
                     raise CompileError("register type mismatch")
                 continue
+            if op in {"input", "const"}:
+                if node["args"]:
+                    raise CompileError(f"incorrect operand count for {op}")
+                continue
             arg_types = [IRType(**self.nodes[arg]["type"]) for arg in node["args"]]
-            if op == "mux" and not (
-                arg_types[0] == BOOL and arg_types[1] == arg_types[2] == typ
-            ):
-                raise CompileError("mux type mismatch")
-            if op in {"eq", "ne", "lt", "le", "gt", "ge"} and not (
-                arg_types[0] == arg_types[1] and typ == BOOL
-            ):
-                raise CompileError("comparison type mismatch")
-            if op in {"shl", "shr"} and not (
-                arg_types[0] == typ and arg_types[1] == IRType(64)
-            ):
-                raise CompileError("shift type mismatch")
-            if op == "not" and not (arg_types[0] == typ == BOOL):
-                raise CompileError("logical negation type mismatch")
-            if op in {
-                "add",
-                "sub",
-                "mul",
-                "div",
-                "mod",
-                "and",
-                "or",
-                "xor",
-                "neg",
-                "inv",
-            } and any(arg_type != typ for arg_type in arg_types):
-                raise CompileError("arithmetic type mismatch")
+            check_operation_types(op, typ, arg_types)
         for port in self.outputs:
             if not 0 <= port["node"] < len(self.nodes):
                 raise CompileError(f"output {port['name']} is not driven")
@@ -398,9 +418,8 @@ class Graph:
     def _combinational_pass(
         self,
         live: list[dict[str, Any]],
-        state: dict[int, int],
-        inputs: dict[str, int],
-        start: int,
+        state: Mapping[int, int],
+        inputs: Mapping[str, int],
     ) -> dict[int, int]:
         """One cycle of pure logic given the current register state."""
         values: dict[int, int] = {}
@@ -411,12 +430,9 @@ class Graph:
                 values[node_id] = state[node_id]
             elif op == "input":
                 name = node["name"]
-                if name == "start":
-                    values[node_id] = start
-                elif name in inputs:
-                    values[node_id] = typ.bits(inputs[name])
-                else:
+                if name not in inputs:
                     raise CompileError(f"missing input {name}")
+                values[node_id] = typ.bits(inputs[name])
             elif op == "const":
                 values[node_id] = node["value"]
             else:
@@ -428,18 +444,64 @@ class Graph:
                 )
         return values
 
+    def _clock_edge(
+        self,
+        live: list[dict[str, Any]],
+        state: Mapping[int, int],
+        values: Mapping[int, int],
+    ) -> dict[int, int]:
+        """Register state after one clock edge: latch ``next`` iff enabled."""
+        return {
+            node["id"]: (
+                IRType(**node["type"]).bits(values[node["args"][0]])
+                if values[node["args"][1]]
+                else state[node["id"]]
+            )
+            for node in live
+            if node["op"] == "register"
+        }
+
+    def reset_state(self) -> dict[int, int]:
+        """Register state immediately after ``rst``: every live register holds
+        its ``init`` value.  Keyed by register node id."""
+        return {
+            node["id"]: node["init"]
+            for node in self.live_nodes()
+            if node["op"] == "register"
+        }
+
+    def step(
+        self, state: Mapping[int, int], **inputs: int
+    ) -> tuple[dict[str, int], dict[int, int]]:
+        """Simulate one clock cycle of a sequential graph on persistent state.
+
+        Settles the combinational logic for the current register ``state`` and
+        the given inputs (``start`` included -- it is an ordinary input here),
+        then applies one clock edge.  Returns ``(outputs, next_state)`` where
+        ``outputs`` are the values visible *during* this cycle.  Unlike
+        :meth:`run`, nothing is reset between calls, so a caller can drive
+        several back-to-back transactions through the same state machine.
+        """
+        live = self.live_nodes()
+        values = self._combinational_pass(live, state, inputs)
+        outputs = {
+            port["name"]: IRType(**port["type"]).number(values[port["node"]])
+            for port in self.outputs
+        }
+        return outputs, self._clock_edge(live, state, values)
+
     def run(self, *, max_cycles: int = 100_000, **inputs: int) -> dict[str, int]:
-        """Simulate a sequential graph under the start/done handshake.
+        """Simulate one transaction of a sequential graph from reset.
 
         The implicit ``start`` input is pulsed on the first cycle; data inputs
         are held stable for the whole run.  The register state advances one tick
         per cycle until the ``done`` output asserts, at which point the settled
         outputs are returned.  Combinational graphs (no registers, no ``done``)
-        should use :meth:`evaluate` instead.
+        should use :meth:`evaluate` instead; :meth:`step` drives persistent state
+        across several transactions.
         """
         live = self.live_nodes()
-        register_nodes = [node for node in live if node["op"] == "register"]
-        if not register_nodes:
+        if not any(node["op"] == "register" for node in live):
             raise CompileError("run() is for sequential graphs; use evaluate()")
         done = next((port for port in self.outputs if port["name"] == "done"), None)
         if done is None:
@@ -447,23 +509,18 @@ class Graph:
         has_start = any(
             node["op"] == "input" and node["name"] == "start" for node in live
         )
-        state = {node["id"]: node["init"] for node in register_nodes}
+        state = self.reset_state()
         for cycle in range(max_cycles):
-            start = 1 if has_start and cycle == 0 else 0
-            values = self._combinational_pass(live, state, inputs, start)
+            stimulus = dict(inputs)
+            if has_start:
+                stimulus["start"] = 1 if cycle == 0 else 0
+            values = self._combinational_pass(live, state, stimulus)
             if cycle > 0 and values[done["node"]]:
                 return {
                     port["name"]: IRType(**port["type"]).number(values[port["node"]])
                     for port in self.outputs
                 }
-            state = {
-                node["id"]: (
-                    IRType(**node["type"]).bits(values[node["args"][0]])
-                    if values[node["args"][1]]
-                    else state[node["id"]]
-                )
-                for node in register_nodes
-            }
+            state = self._clock_edge(live, state, values)
         raise CompileError(f"simulation did not finish within {max_cycles} cycles")
 
     def to_dict(self) -> dict[str, Any]:
@@ -479,8 +536,8 @@ class Graph:
             "nodes": nodes,
         }
         if sequential:
-            # A single implicit clock domain drives every register; the reset is
-            # asynchronous and loads each register's `init` value.
+            # One global clock domain drives every register; one global reset
+            # (asynchronous, active high) loads each register's `init` value.
             payload["clock"] = {"name": "clk", "reset": "rst", "edge": "posedge"}
         return payload
 

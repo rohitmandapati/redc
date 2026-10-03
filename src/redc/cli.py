@@ -146,3 +146,37 @@ def dump_ir(
         typer.echo(f"redc: {error}", err=True)
         raise typer.Exit(code=1) from error
     typer.echo(f"Wrote {output}")
+
+
+@app.command("dump-netlist")
+def dump_netlist(
+    source: SourcePath,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output", "-o", help="Write JSON to this path instead of stdout."
+        ),
+    ] = None,
+    top: Annotated[str, typer.Option(help="Top-level RedC function.")] = "main",
+) -> None:
+    """Print or write the unplaced Minecraft PhysicalNetlist (debug view)."""
+    import json
+
+    from .physical import lower_to_physical
+
+    graph = _compile(source, top, Limits())
+    try:
+        payload = json.dumps(lower_to_physical(graph).to_dict(), indent=2) + "\n"
+    except CompileError as error:
+        typer.echo(f"redc: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    if output is None:
+        typer.echo(payload, nl=False)
+        return
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(payload, encoding="utf-8")
+    except OSError as error:
+        typer.echo(f"redc: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Wrote {output}")

@@ -1,14 +1,23 @@
 # Type-cast cells.  The two pins carry different datatypes, so there is no family
 # default -- every pin names its own.  Key convention:
 #   <src>_to_<dst>_<pin>-<x>-<y>-<z>...
+# A cast is identified by its FULL source and destination types: uint8 -> uint16
+# (zero-extend), int8 -> int16 (sign-extend), int8 -> uint16 and uint8 -> bool
+# (!= 0) are all different cells.  One variant per ordered pair of distinct
+# supported types; identity casts never occur (the IR elides them).
+# Geometry stubs: no Minecraft structure exists yet (nbt: null).
 family: type_cast
 
 variants:
-  uint8_to_uint4_in-0-0-0_out-0-0-0:
-    latency: 0
+  "{src}_to_{dst}_in-0-0-0_out-0-0-0":
+    expand:
+      src: [bool, uint4, int4, uint8, int8, uint16, int16, uint32, int32, uint64, int64]
+      dst: [bool, uint4, int4, uint8, int8, uint16, int16, uint32, int32, uint64, int64]
+    unless_equal: [src, dst]
+    latency: null       # unknown until measured (truncation may be free wiring)
     dim: [1, 1, 1]
-    nbt: uint8_to_uint4_in-0-0-0_out-0-0-0.nbt
+    nbt: null
     inputs:
-      - {name: in, datatype: uint8, face: WEST, offset: [0, 0, 0]}
+      - {name: in, datatype: "{src}", face: WEST, offset: [0, 0, 0]}
     outputs:
-      - {name: out, datatype: uint4, face: EAST, offset: [0, 0, 0]}
+      - {name: out, datatype: "{dst}", face: EAST, offset: [0, 0, 0]}
