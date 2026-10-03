@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__REDC_TITLE__</title>
+<style>
+  :root { color-scheme: dark; --bg: #101418; --panel: #182028; --line: #2a3542; --text: #d8dee6; --muted: #8a96a6; --accent: #4f8fdf; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #app { display: grid; grid-template-columns: 270px 1fr 300px; height: 100vh; }
+  aside { background: var(--panel); border-right: 1px solid var(--line); padding: 10px 12px; overflow-y: auto; }
+  #info { border-right: 0; border-left: 1px solid var(--line); }
+  h1 { font-size: 15px; margin: 0 0 6px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 0 6px; }
+  section { margin-bottom: 8px; }
+  button, select, input[type=file] { background: #222c38; color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 3px 7px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  select { width: 100%; margin-top: 3px; }
+  .row { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; margin: 4px 0; }
+  #timeline { width: 100%; margin: 6px 0 2px; }
+  #position, #meta, .muted { color: var(--muted); }
+  .layers label { display: block; margin: 2px 0; cursor: pointer; }
+  .layers label.absent { display: none; }
+  main#scene { position: relative; overflow: hidden; }
+  #status { position: absolute; left: 10px; bottom: 8px; padding: 4px 8px; background: rgba(16, 20, 24, .78); border-radius: 4px; pointer-events: none; white-space: pre; }
+  #error { position: absolute; inset: 20% 15% auto 15%; z-index: 10; background: #3a1d22; border: 1px solid #c4485a; border-radius: 6px; padding: 12px 16px; }
+  #error[hidden] { display: none; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 2px 4px; vertical-align: top; border-bottom: 1px solid var(--line); word-break: break-word; }
+  td:first-child { color: var(--muted); white-space: nowrap; width: 1%; }
+  pre#event { white-space: pre-wrap; word-break: break-all; font-size: 11px; background: #11171d; padding: 6px; border-radius: 4px; max-height: 40vh; overflow-y: auto; }
+  .label { color: #fff; font-size: 11px; padding: 1px 4px; background: rgba(0, 0, 0, .55); border-radius: 3px; white-space: nowrap; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="app">
+  <aside id="panel">
+    <h1>RedC P&amp;R replay</h1>
+    <div id="meta">no trace loaded</div>
+
+    <h2>Timeline</h2>
+    <section>
+      <div class="row">
+        <button id="btn-start" title="Start (Home)">&#x23EE;</button>
+        <button id="btn-back" title="Step back (&larr;)">&#x25C0;</button>
+        <button id="btn-play" title="Play / pause (space)">&#x25B6; Play</button>
+        <button id="btn-fwd" title="Step forward (&rarr;)">&#x25B6;&#xFE0E;|</button>
+        <button id="btn-end" title="Final (End)">&#x23ED;</button>
+      </div>
+      <input id="timeline" type="range" min="0" max="0" value="0" step="1">
+      <div id="position">0 / 0</div>
+      <div class="row">Speed
+        <select id="speed" style="width:auto">
+          <option value="1">1 event/s</option>
+          <option value="5">5 events/s</option>
+          <option value="20" selected>20 events/s</option>
+          <option value="60">60 events/s</option>
+          <option value="250">250 events/s</option>
+          <option value="1000">1000 events/s</option>
+          <option value="5000">5000 events/s</option>
+        </select>
+      </div>
+    </section>
+
+    <h2>Jump to</h2>
+    <section>
+      <label>P&amp;R attempt<select id="attempt-select"></select></label>
+      <label>Routing iteration<select id="iteration-select"></select></label>
+      <div class="row"><button id="btn-final">Final result</button></div>
+    </section>
+
+    <h2>Layers</h2>
+    <section class="layers">
+      <label><input type="checkbox" data-layer="components" checked> components</label>
+      <label><input type="checkbox" data-layer="labels"> component labels</label>
+      <label><input type="checkbox" data-layer="ports" checked> ports</label>
+      <label><input type="checkbox" data-layer="wires" checked> wires</label>
+      <label><input type="checkbox" data-layer="voxels"> wire cells (voxels)</label>
+      <label id="layer-search"><input type="checkbox" data-layer="search" checked> routing search</label>
+      <label id="layer-congestion"><input type="checkbox" data-layer="congestion" checked> congestion</label>
+      <label><input type="checkbox" data-layer="grid" checked> grid</label>
+      <label><input type="checkbox" data-layer="bounds" checked> bounding boxes</label>
+    </section>
+
+    <h2>Camera</h2>
+    <section class="row">
+      <button data-view="fit">Fit</button>
+      <button data-view="iso">Iso</button>
+      <button data-view="top">Top</button>
+      <button data-view="front">Front</button>
+      <button data-view="side">Side</button>
+    </section>
+
+    <h2>Legend</h2>
+    <section id="legend"></section>
+
+    <h2>Trace file</h2>
+    <section><input type="file" id="file-input" accept=".json,.jsonl"></section>
+  </aside>
+
+  <main id="scene">
+    <div id="error" hidden></div>
+    <div id="status"></div>
+  </main>
+
+  <aside id="info">
+    <h2>Selection</h2>
+    <div id="selection" class="muted">Click a component or a wire.</div>
+    <h2>Current event</h2>
+    <pre id="event">-</pre>
+  </aside>
+</div>
+
+<script type="application/json" id="redc-trace">__REDC_TRACE_JSON__</script>
+<script>
+  // Shown only if the module below never starts (e.g. no network for the CDN).
+  setTimeout(function () {
+    if (!window.__redcViewerStarted) {
+      var box = document.getElementById('error');
+      box.hidden = false;
+      box.textContent = 'The 3D viewer did not start. It loads Three.js from cdn.jsdelivr.net, ' +
+        'so it needs network access. See the browser console for details.';
+    }
+  }, 8000);
+</script>
+<script type="module">
+/*__REDC_VIEWER_JS__*/
+</script>
+</body>
+</html>
