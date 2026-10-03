@@ -8,8 +8,9 @@ source-level assignment there only creates a new signal value.
 A loop whose bound depends on a runtime value cannot be unrolled, so it is
 lowered instead into a clocked finite state machine: its loop-carried variables
 become registers, one iteration runs per clock tick, and the enclosing function
-gains a ``start``/``done`` handshake. This is what makes stateful programs such
-as the Fibonacci example compile. Sequential lowering is intentionally scoped in
+gains a reusable ``start``/``done`` handshake (idle -> running -> one-cycle
+``done`` -> idle; ``start`` while busy is ignored). This is what makes stateful
+programs such as the Fibonacci example compile. Sequential lowering is intentionally scoped in
 v1 to a single, unconditional runtime-bounded loop in the top-level function.
 """
 
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from .ir import BOOL, Graph, IRType, Literal, Value, type_from_name
+from .ir import BOOL, SHIFT_AMOUNT, Graph, IRType, Literal, Value, type_from_name
 from .parser import AST, CompileError, parse
 
 
@@ -163,7 +164,7 @@ class Compiler:
             constant = self.graph.constant_value(right_value)
             if constant is not None and right_value.type.number(constant) < 0:
                 where.fail("negative constant shift count")
-            right_value = self.graph.cast(right_value, IRType(64))
+            right_value = self.graph.cast(right_value, SHIFT_AMOUNT)
             return self.graph.op(
                 BINARY_OPS[operator], left_value.type, left_value, right_value
             )
@@ -623,10 +624,11 @@ class Compiler:
     ) -> list[Path]:
         """Lower a runtime-bounded loop into a clocked FSM with registers.
 
-        Loop-carried variables become registers seeded (on ``start``) with their
-        pre-loop values; the loop body is elaborated once to derive each
-        register's next-iteration value; a ``running`` register plus the loop
-        condition sequence one iteration per clock and raise ``done`` on exit.
+        Loop-carried variables become registers seeded (when an idle FSM accepts
+        ``start``) with their pre-loop values; the loop body is elaborated once
+        to derive each register's next-iteration value; a ``running`` register
+        plus the loop condition sequence one iteration per clock, raise ``done``
+        for exactly one cycle on exit, and return to idle.
         """
         if len(self.call_stack) != 1:
             node.fail(
@@ -701,16 +703,27 @@ class Compiler:
             if step is not None:
                 self.statement(step, body_state, loop + 1, switch)
 
-            # Wire the FSM: start loads the pre-loop values, each running tick
-            # loads the next-iteration values, exit holds the final values.
+            # Wire the FSM.  `start` is only *accepted* while idle, so a pulse
+            # during a transaction is ignored rather than restarting it.
+            #   accept       = start && !running
+            #   active       = running && condition
+            #   running'     = accept || active        (latched every cycle)
+            #   carried'     = accept ? preloop : next-iteration
+            #   carried.en   = accept || active
+            #   done         = running && !condition
+            # On the exit cycle `done` is high and `running` falls, so the next
+            # cycle is idle again and the same hardware accepts a new `start`.
             start = self.control_start()
             running = self.graph.register(BOOL)
+            accept = self.graph.op(
+                "and", BOOL, start, self.graph.op("not", BOOL, running)
+            )
             active = self.graph.op("and", BOOL, running, condition)
-            enable = self.graph.op("or", BOOL, start, active)
+            enable = self.graph.op("or", BOOL, accept, active)
             for name, _, _ in carried:
                 register = registers[name]
                 next_value = self.graph.mux(
-                    start, preloop[name], body_state.lookup(name, node)[1].values[0]
+                    accept, preloop[name], body_state.lookup(name, node)[1].values[0]
                 )
                 self.graph.set_register(register, next_value, enable)
             self.graph.set_register(running, enable, self.true)

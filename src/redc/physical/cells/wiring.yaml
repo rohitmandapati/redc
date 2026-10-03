@@ -1,12 +1,16 @@
-# Signal-carrying passthrough cells (buffers / repeaters).
+# Signal-carrying passthrough cells (buffers / repeaters): combinational, with a
+# nonzero propagation delay.  One per supported datatype.
+# Geometry stubs: no Minecraft structure exists yet (nbt: null).
 family: wiring
-datatype: uint8
 
 variants:
-  uint8_buffer_in-0-0-0_out-0-0-0:
+  "{t}_buffer_in-0-0-0_out-0-0-0":
+    expand:
+      t: [bool, uint4, int4, uint8, int8, uint16, int16, uint32, int32, uint64, int64]
+    datatype: "{t}"
     latency: 1
     dim: [1, 1, 1]
-    nbt: uint8_buffer_in-0-0-0_out-0-0-0.nbt
+    nbt: null
     inputs:
       - {name: in, face: WEST, offset: [0, 0, 0]}
     outputs:
