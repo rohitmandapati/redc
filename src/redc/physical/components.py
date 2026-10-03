@@ -8,9 +8,10 @@ register's reset value) lives on :class:`~redc.physical.netlist.ComponentInstanc
 
 Every component carries:
 
-* ``latency`` -- physical *propagation delay* in redstone ticks.  It says
-  nothing about state: a NOT gate is combinational with ``latency == 1``, an
-  adder is combinational with several ticks of delay, and a zero-tick adder is
+* ``latency`` -- physical *propagation delay* in redstone ticks, or ``None``
+  when it is not yet known (a stub with no measured circuit).  It says nothing
+  about state: a NOT gate is combinational with ``latency == 1``, an adder is
+  combinational with several ticks of delay, and a zero-tick adder is
   combinational with ``latency == 0``.
 * :attr:`~Component.is_stateful` / :attr:`~Component.is_combinational` -- the
   independent "does this cell hold state?" property.  Only :class:`Register` is
@@ -30,12 +31,18 @@ Operation-implementing cells report their exact
 :class:`~redc.physical.cells.Library` indexes them (full type identity, never
 width alone).
 
-This module defines the data model *and* each cell's functional ``behavior``: the
-base :class:`Component`; the datapath families :class:`Operation`,
-:class:`PrimitiveGate`, :class:`Wiring`, :class:`TypeCast` and :class:`Register`;
-and the :class:`Boundary` cells (:class:`InputPad`, :class:`OutputPad`,
-:class:`Constant`, :class:`ClockSource`, :class:`ResetSource`) that join the
-fabric to the outside world.  A :class:`Clock` describes the single global
+This module defines the data model *and* each cell's functional ``behavior``.
+The families fall into four categories:
+
+* compute -- :class:`Operation`, :class:`PrimitiveGate`, :class:`TypeCast`,
+  :class:`Register` (the only ones with operation signatures);
+* routing / timing -- :class:`Wiring`;
+* logical / control boundaries -- the :class:`Boundary` cells
+  (:class:`InputPad`, :class:`OutputPad`, :class:`Constant`,
+  :class:`ClockSource`, :class:`ResetSource`): abstract, built on demand;
+* physical user interfaces -- :class:`Peripheral`: real Minecraft devices
+  (levers, displays, ...) with their own geometry, loaded from YAML.
+  A :class:`Clock` describes the single global
 domain every register shares.  Concrete cells are named by convention, e.g.
 ``uint8_add_a-0-0-0_b-0-0-1_out-0-0-2`` -- datatype, op, then each pin's
 offset -- and a signature may have several layout variants for the router to
@@ -110,11 +117,11 @@ class Port:
 class Component:
     """A placeable cell definition with a footprint, timing, and typed pins.
 
-    ``latency`` is propagation delay in ticks and is independent of
-    :attr:`is_combinational` (see the module docstring)."""
+    ``latency`` is propagation delay in ticks (``None`` = unknown) and is
+    independent of :attr:`is_combinational` (see the module docstring)."""
 
     name: str
-    latency: int
+    latency: int | None
     dim: tuple[int, int, int]
     inputs: tuple[Port, ...]
     outputs: tuple[Port, ...]
@@ -123,7 +130,7 @@ class Component:
     nbt: str | None = None
 
     def __post_init__(self) -> None:
-        if self.latency < 0:
+        if self.latency is not None and self.latency < 0:
             raise CompileError(f"{self.name}: latency must be non-negative")
         if any(d <= 0 for d in self.dim):
             raise CompileError(f"{self.name}: dimensions must be positive, got {self.dim}")
@@ -465,6 +472,70 @@ class Register(Component):
             return self.reset_value(init)
         mask = self.data_type.mask
         return (inputs[self.NEXT] & mask) if inputs[self.ENABLE] else (state & mask)
+
+
+# --------------------------------------------------------------------------
+# Physical user interfaces.
+# --------------------------------------------------------------------------
+
+
+class PeripheralDirection(Enum):
+    """Which way a peripheral moves a value across the design boundary."""
+
+    INPUT = "input"  # Minecraft device -> internal net (lever, button, ...)
+    OUTPUT = "output"  # internal net -> Minecraft device (lamp, display, ...)
+
+
+@dataclass(frozen=True)
+class Peripheral(Component):
+    """A real Minecraft-facing interface device at the design boundary.
+
+    Unlike the abstract :class:`Boundary` pads, a peripheral is an actual
+    structure with geometry the placer must make room for.  It is NOT a compute
+    cell: it has no operation signature and never appears as an implementation
+    candidate.  ``kind`` names the interface (``"lever"``, ``"2-dig-7-seg"``,
+    ...).  An INPUT peripheral has no inputs and one output pin that sources a
+    value into the netlist; an OUTPUT peripheral has one input pin and no
+    outputs.  Its terminals obey the ordinary netlist rules (exact types, one
+    driver)."""
+
+    kind: str = ""
+    direction: PeripheralDirection | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.kind:
+            raise CompileError(f"{self.name}: a peripheral needs a kind")
+        if self.direction is PeripheralDirection.INPUT:
+            if self.inputs or len(self.outputs) != 1:
+                raise CompileError(
+                    f"{self.name}: an input peripheral has no inputs and one output"
+                )
+        elif self.direction is PeripheralDirection.OUTPUT:
+            if self.outputs or len(self.inputs) != 1:
+                raise CompileError(
+                    f"{self.name}: an output peripheral has one input and no outputs"
+                )
+        else:
+            raise CompileError(f"{self.name}: a peripheral needs a direction")
+
+    @property
+    def dtype(self) -> IRType:
+        """The logical datatype the device carries."""
+        return self.ports[0].dtype
+
+    @property
+    def is_source(self) -> bool:
+        return self.direction is PeripheralDirection.INPUT
+
+    @property
+    def is_sink(self) -> bool:
+        return self.direction is PeripheralDirection.OUTPUT
+
+    def behavior(self, inputs: Mapping[str, int]) -> dict[str, int]:
+        if self.is_sink:
+            return {}
+        return super().behavior(inputs)  # driven by the stimulus, like InputPad
 
 
 # --------------------------------------------------------------------------

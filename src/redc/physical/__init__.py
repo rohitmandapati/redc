@@ -8,10 +8,20 @@ Contracts established here (technology mapping itself comes later):
   :class:`ImplementationRegistry` of direct-cell and composite candidates.
 * :mod:`.components` / :mod:`.cells` -- cell definitions and the YAML library.
 * :mod:`.netlist` -- instances + nets, one global clock and reset domain.
+* :mod:`.boundary` -- which pad or :class:`Peripheral` realizes each module port.
+* :mod:`.techmap` -- :func:`lower_to_physical`: IR Graph -> unplaced netlist.
+* :mod:`.simulate` -- functional netlist simulation, to check tech-map vs the IR.
 * :mod:`.grid` -- the occupancy grid for placement and routing.
 """
 
+from .boundary import (
+    DEFAULT_BOUNDARY_POLICY,
+    BoundaryPolicy,
+    DefaultBoundaryPolicy,
+    PadBoundaryPolicy,
+)
 from .cells import GATES, LIBRARY, OPERATIONS, REGISTERS, TYPE_CASTS, WIRING, Library
+from .cells.peripheral import PERIPHERALS, PeripheralLibrary
 from .components import (
     Boundary,
     Clock,
@@ -22,6 +32,8 @@ from .components import (
     InputPad,
     Operation,
     OutputPad,
+    Peripheral,
+    PeripheralDirection,
     Port,
     PortDir,
     PrimitiveGate,
@@ -48,18 +60,22 @@ from .signals import (
     require_supported_physical_type,
     signal_layout,
 )
+from .techmap import lower_to_physical, select_first_variant
 
 __all__ = [
+    "DEFAULT_BOUNDARY_POLICY",
     "EMPTY",
     "GATES",
     "LIBRARY",
     "MAX_HEIGHT",
     "OPERATIONS",
+    "PERIPHERALS",
     "PHYSICAL_TYPES",
     "REGISTERS",
     "TYPE_CASTS",
     "WIRING",
     "Boundary",
+    "BoundaryPolicy",
     "CellKind",
     "Clock",
     "ClockSource",
@@ -67,6 +83,7 @@ __all__ = [
     "ComponentInstance",
     "CompositeImplementation",
     "Constant",
+    "DefaultBoundaryPolicy",
     "DirectCellImplementation",
     "Face",
     "Grid",
@@ -77,6 +94,10 @@ __all__ = [
     "Operation",
     "OperationSignature",
     "OutputPad",
+    "PadBoundaryPolicy",
+    "Peripheral",
+    "PeripheralDirection",
+    "PeripheralLibrary",
     "PhysicalImplementation",
     "PhysicalNetlist",
     "PhysicalSignalLayout",
@@ -91,6 +112,8 @@ __all__ = [
     "TypeCast",
     "Wiring",
     "is_supported_physical_type",
+    "lower_to_physical",
     "require_supported_physical_type",
+    "select_first_variant",
     "signal_layout",
 ]

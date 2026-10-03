@@ -41,7 +41,15 @@ from typing import Any
 
 from ..ir import IRType
 from ..parser import CompileError
-from .components import ClockSource, Component, Port, PortDir, Register, ResetSource
+from .components import (
+    ClockSource,
+    Component,
+    Peripheral,
+    Port,
+    PortDir,
+    Register,
+    ResetSource,
+)
 from .signals import PhysicalSignalLayout, signal_layout
 
 
@@ -56,12 +64,18 @@ class ComponentInstance:
     ``init`` is per-instance state: the reset value of a :class:`Register`
     instance (validated against its data type and stored as raw bits; defaults to
     0, like an IR register).  It must be ``None`` for every other component.
+
+    ``label`` optionally records what the instance realizes -- tech-map uses the
+    module port name for boundary instances (``"in_a"``, ``"start"``,
+    ``"result"``) and ``"n<id>"`` for the IR node of a compute cell.  It is
+    purely informational (debug dumps, binding simulation stimulus).
     """
 
     id: int
     component: Component
     origin: tuple[int, int, int] | None = None
     init: int | None = None
+    label: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.component, Register):
@@ -209,10 +223,12 @@ class PhysicalNetlist:
         origin: tuple[int, int, int] | None = None,
         *,
         init: int | None = None,
+        label: str | None = None,
     ) -> ComponentInstance:
         """Instantiate ``component`` into the netlist and return the instance.
-        ``init`` is the reset value of a register instance."""
-        inst = ComponentInstance(self._fresh_id(), component, origin, init)
+        ``init`` is the reset value of a register instance; ``label`` an
+        optional description of what it realizes."""
+        inst = ComponentInstance(self._fresh_id(), component, origin, init, label)
         self.instances[inst.id] = inst
         return inst
 
@@ -324,8 +340,15 @@ class PhysicalNetlist:
                 "component": inst.component.name,
                 "origin": list(inst.origin) if inst.origin is not None else None,
             }
+            if inst.label is not None:
+                entry["label"] = inst.label
             if inst.init is not None:
                 entry["init"] = inst.init
+            component = inst.component
+            if isinstance(component, Peripheral) and component.direction is not None:
+                entry["kind"] = "peripheral"
+                entry["peripheral"] = component.kind
+                entry["direction"] = component.direction.value
             instances.append(entry)
         payload: dict[str, Any] = {
             "sequential": self.is_sequential,

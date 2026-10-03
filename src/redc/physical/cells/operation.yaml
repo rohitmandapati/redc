@@ -9,7 +9,9 @@
 # Shift amounts are always a uint64 input, matching the IR.
 #
 # These are geometry stubs: no Minecraft structure exists yet (nbt: null) and
-# latency is a placeholder until real circuits are measured.
+# latency is unknown (null) until real circuits are measured.  bool is covered
+# for every op the IR can type on it; bool and/or/xor (and not) are the gate
+# cells in primitive_gate.yaml, so and/or/xor are integer-only here.
 family: operation
 
 # Anchors only -- the loader reads `datatype` and `variants`.
@@ -19,7 +21,7 @@ types:
 
 layouts:
   binary: &binary
-    latency: 0
+    latency: null
     dim: [1, 1, 3]
     nbt: null
     inputs:
@@ -28,7 +30,7 @@ layouts:
     outputs:
       - {name: out, face: EAST, offset: [0, 0, 2]}
   compare: &compare
-    latency: 0
+    latency: null
     dim: [1, 1, 3]
     nbt: null
     inputs:
@@ -37,7 +39,7 @@ layouts:
     outputs:
       - {name: out, datatype: bool, face: EAST, offset: [0, 0, 2]}
   unary: &unary
-    latency: 0
+    latency: null
     dim: [1, 1, 1]
     nbt: null
     inputs:
@@ -45,7 +47,7 @@ layouts:
     outputs:
       - {name: out, face: EAST, offset: [0, 0, 0]}
   shift: &shift
-    latency: 0
+    latency: null
     dim: [1, 1, 3]
     nbt: null
     inputs:
@@ -54,7 +56,7 @@ layouts:
     outputs:
       - {name: out, face: EAST, offset: [0, 0, 2]}
   mux: &mux
-    latency: 0
+    latency: null
     dim: [1, 1, 3]
     nbt: null
     inputs:
@@ -66,7 +68,7 @@ layouts:
 
 variants:
   # -- arithmetic / bitwise: op(T, T) -> T ----------------------------------
-  "{t}_add_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: add, datatype: "{t}", expand: {t: *ints}}
+  "{t}_add_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: add, datatype: "{t}", expand: {t: *all}}
 
   # Same op, inputs stacked vertically instead of along z -- a second layout
   # the router can pick when neighbours constrain the z axis.  Candidates for
@@ -74,7 +76,7 @@ variants:
   uint8_add_a-0-0-0_b-0-1-0_out-0-2-0:
     op: add
     datatype: uint8
-    latency: 0
+    latency: null
     dim: [1, 3, 1]
     nbt: null
     inputs:
@@ -83,31 +85,31 @@ variants:
     outputs:
       - {name: out, face: EAST, offset: [0, 2, 0]}
 
-  "{t}_sub_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: sub, datatype: "{t}", expand: {t: *ints}}
-  "{t}_mul_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: mul, datatype: "{t}", expand: {t: *ints}}
-  "{t}_div_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: div, datatype: "{t}", expand: {t: *ints}}
-  "{t}_mod_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: mod, datatype: "{t}", expand: {t: *ints}}
+  "{t}_sub_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: sub, datatype: "{t}", expand: {t: *all}}
+  "{t}_mul_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: mul, datatype: "{t}", expand: {t: *all}}
+  "{t}_div_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: div, datatype: "{t}", expand: {t: *all}}
+  "{t}_mod_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: mod, datatype: "{t}", expand: {t: *all}}
   "{t}_and_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: and, datatype: "{t}", expand: {t: *ints}}
   "{t}_or_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: or, datatype: "{t}", expand: {t: *ints}}
   "{t}_xor_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *binary, op: xor, datatype: "{t}", expand: {t: *ints}}
 
   # -- unary: op(T) -> T ----------------------------------------------------
-  "{t}_neg_a-0-0-0_out-0-0-0": {<<: *unary, op: neg, datatype: "{t}", expand: {t: *ints}}
-  "{t}_inv_a-0-0-0_out-0-0-0": {<<: *unary, op: inv, datatype: "{t}", expand: {t: *ints}}
+  "{t}_neg_a-0-0-0_out-0-0-0": {<<: *unary, op: neg, datatype: "{t}", expand: {t: *all}}
+  "{t}_inv_a-0-0-0_out-0-0-0": {<<: *unary, op: inv, datatype: "{t}", expand: {t: *all}}
 
   # -- comparisons: op(T, T) -> bool ----------------------------------------
   "{t}_eq_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *compare, op: eq, datatype: "{t}", expand: {t: *all}}
   "{t}_ne_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *compare, op: ne, datatype: "{t}", expand: {t: *all}}
-  "{t}_lt_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *compare, op: lt, datatype: "{t}", expand: {t: *ints}}
-  "{t}_le_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *compare, op: le, datatype: "{t}", expand: {t: *ints}}
-  "{t}_gt_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *compare, op: gt, datatype: "{t}", expand: {t: *ints}}
-  "{t}_ge_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *compare, op: ge, datatype: "{t}", expand: {t: *ints}}
+  "{t}_lt_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *compare, op: lt, datatype: "{t}", expand: {t: *all}}
+  "{t}_le_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *compare, op: le, datatype: "{t}", expand: {t: *all}}
+  "{t}_gt_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *compare, op: gt, datatype: "{t}", expand: {t: *all}}
+  "{t}_ge_a-0-0-0_b-0-0-1_out-0-0-2": {<<: *compare, op: ge, datatype: "{t}", expand: {t: *all}}
 
   # -- variable shifts: op(T value, uint64 amount) -> T ---------------------
   # shr on a signed T is arithmetic, on an unsigned T logical; the signature's
   # value type keeps them distinct.  Constant shifts are a later rewrite.
-  "{t}_shl_value-0-0-0_amount-0-0-1_out-0-0-2": {<<: *shift, op: shl, datatype: "{t}", expand: {t: *ints}}
-  "{t}_shr_value-0-0-0_amount-0-0-1_out-0-0-2": {<<: *shift, op: shr, datatype: "{t}", expand: {t: *ints}}
+  "{t}_shl_value-0-0-0_amount-0-0-1_out-0-0-2": {<<: *shift, op: shl, datatype: "{t}", expand: {t: *all}}
+  "{t}_shr_value-0-0-0_amount-0-0-1_out-0-0-2": {<<: *shift, op: shr, datatype: "{t}", expand: {t: *all}}
 
   # -- select: mux(bool sel, T yes, T no) -> T ------------------------------
   "{t}_mux_sel-0-0-0_yes-0-0-1_no-0-0-2_out-0-0-2": {<<: *mux, op: mux, datatype: "{t}", expand: {t: *all}}

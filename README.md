@@ -36,8 +36,12 @@ be started again without a reset; a `start` while busy is ignored.
 
 ## Physical (Minecraft) layer
 
-`redc.physical` holds the contracts the future technology mapper targets. It
-does not yet lower IR to a netlist.
+`redc.physical` lowers the IR to an unplaced `PhysicalNetlist` (technology
+mapping; placement and routing come next):
+
+```bash
+uv run redc dump-netlist examples/uint8_fib.redc --top fib
+```
 
 - **Types:** the language accepts widths 1–64, but Minecraft supports only
   `bool`, `uint4/int4`, `uint8/int8`, `uint16/int16`, `uint32/int32` and
@@ -51,6 +55,9 @@ does not yet lower IR to a netlist.
   statefulness: only registers are sequential.
 - **Clock/reset:** there is one global clock and one global active-high reset
   per design. Each register's reset value belongs to the instance, not the cell.
+- **Peripherals:** real Minecraft I/O devices sit at the boundary. Until source
+  annotations exist, `start` maps to a lever and a `uint8 result` to a two-digit
+  seven-segment display (placeholder geometry); other ports use abstract pads.
 
 See `examples/` for sample programs.
 

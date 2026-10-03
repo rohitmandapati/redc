@@ -4,7 +4,7 @@ Each family module (``operation.py``, ``primitive_gate.py``, ...) calls
 :func:`load_family` with its YAML sibling and the family class.  The YAML is the
 *contract* the placer and router read; the ``nbt`` field only names the
 structure file that realises the cell (``null`` until one exists), and is never
-opened here.
+opened here.  ``latency`` is required but may be ``null`` (unknown / unmeasured).
 
 A variant is either written out explicitly or, to avoid hand-copying one layout
 per datatype, *parametric*: an ``expand`` mapping of placeholder -> list of
@@ -33,12 +33,24 @@ import yaml
 
 from ...ir import IRType, type_from_name
 from ...parser import CompileError
-from ..components import Component, Face, Port, PortDir
+from ..components import Component, Face, PeripheralDirection, Port, PortDir
 
 #: Every key a variant may carry; anything else (e.g. a per-cell ``init``) is a
 #: contract violation, not something to silently ignore.
 _VARIANT_KEYS = frozenset(
-    {"op", "latency", "dim", "nbt", "inputs", "outputs", "datatype", "expand", "unless_equal"}
+    {
+        "op",
+        "kind",
+        "direction",
+        "latency",
+        "dim",
+        "nbt",
+        "inputs",
+        "outputs",
+        "datatype",
+        "expand",
+        "unless_equal",
+    }
 )
 _PIN_KEYS = frozenset({"name", "face", "offset", "datatype"})
 
@@ -125,6 +137,9 @@ def _build[C: Component](
             )
         return tuple(built)
 
+    if "latency" not in spec:
+        # Required but nullable: `latency: null` states "not measured yet".
+        raise CompileError(f"{name}: missing latency (use null if unknown)")
     kwargs: dict[str, Any] = {
         "name": name,
         "latency": spec["latency"],
@@ -135,6 +150,13 @@ def _build[C: Component](
     }
     if "op" in spec:  # Operation / PrimitiveGate
         kwargs["op"] = spec["op"]
+    if "kind" in spec:  # Peripheral
+        kwargs["kind"] = spec["kind"]
+    if "direction" in spec:  # Peripheral
+        try:
+            kwargs["direction"] = PeripheralDirection(spec["direction"])
+        except ValueError as exc:
+            raise CompileError(f"{name}: {exc}") from exc
 
     try:
         return cls(**kwargs)

@@ -41,7 +41,7 @@ def test_loaded_operation_matches_its_contract() -> None:
     add = OPERATIONS["uint8_add_a-0-0-0_b-0-0-1_out-0-0-2"]
     assert isinstance(add, Operation)
     assert add.op == "add"
-    assert add.latency == 0
+    assert add.latency is None  # unknown until a real circuit is measured
     assert add.dim == (1, 1, 3)
     assert add.nbt is None  # no structure file exists yet
     assert [p.name for p in add.inputs] == ["a", "b"]

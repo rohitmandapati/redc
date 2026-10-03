@@ -14,7 +14,7 @@ variants:
       src: [bool, uint4, int4, uint8, int8, uint16, int16, uint32, int32, uint64, int64]
       dst: [bool, uint4, int4, uint8, int8, uint16, int16, uint32, int32, uint64, int64]
     unless_equal: [src, dst]
-    latency: 0
+    latency: null       # unknown until measured (truncation may be free wiring)
     dim: [1, 1, 1]
     nbt: null
     inputs:

@@ -1,0 +1,34 @@
+# Physical user-interface devices at the design boundary (NOT compute cells:
+# they have no operation signature).  Looked up by (kind, datatype, direction).
+# Key convention:  <datatype>_<kind>_<pin>-<x>-<y>-<z>...
+#
+# !!! PLACEHOLDERS !!!  None of these devices has been built yet:
+#   * dim and pin offsets/faces are provisional geometry, chosen only so that
+#     placement and routing can be developed against realistically sized
+#     boundary objects -- they are NOT the eventual Minecraft footprints;
+#   * latency is unknown (null), not zero;
+#   * no NBT structure exists (nbt: null).
+family: peripheral
+
+variants:
+  # A lever the player flips: sources one bool into the circuit.
+  bool_lever_out-1-0-0:
+    kind: lever
+    direction: input
+    datatype: bool
+    latency: null
+    dim: [2, 2, 2]
+    nbt: null
+    outputs:
+      - {name: out, face: EAST, offset: [1, 0, 0]}
+
+  # Two hex/decimal digits of seven-segment display: consumes one uint8.
+  uint8_2-dig-7-seg_in-2-0-0:
+    kind: 2-dig-7-seg
+    direction: output
+    datatype: uint8
+    latency: null
+    dim: [6, 5, 2]
+    nbt: null
+    inputs:
+      - {name: in, face: NORTH, offset: [2, 0, 0]}
