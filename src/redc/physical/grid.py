@@ -71,6 +71,9 @@ CAPACITY = 1
 PRESENT_FACTOR = 0.5
 HISTORY_INCREMENT = 1.0
 
+#: Raw ``CellKind`` values a wire may pass through (see :meth:`Grid.is_routable`).
+_ROUTABLE = (0, 3)  # FREE, WIRE
+
 #: The six axis-aligned moves a wire may take (redstone has no diagonals).
 _MOVES = (
     (1, 0, 0),
@@ -174,6 +177,11 @@ class Grid:
                 f"exceeding max_z={self.max_z}"
             )
 
+    def fits_span(self, x: int, z: int) -> bool:
+        """Whether using column ``(x, z)`` keeps the used region within the
+        ``max_x`` / ``max_z`` span caps.  Never raises."""
+        return self._horizontal_ok(x, z)
+
     def _horizontal_ok(self, x: int, z: int) -> bool:
         """Whether using ``(x, z)`` stays within the span caps (predicate form of
         :meth:`_check_horizontal`, for neighbour enumeration -- never raises)."""
@@ -217,12 +225,18 @@ class Grid:
 
         need_x = hi_x - lo_x + 1
         need_z = hi_z - lo_z + 1
-        new_nx = max(need_x, 2 * self._nx)
-        new_nz = max(need_z, 2 * self._nz)
+        # Grow only a deficient axis.  Doubling an axis that already fits would
+        # make repeated outward writes along the other axis blow up
+        # exponentially in memory.
+        new_nx = self._nx if 0 <= px < self._nx else max(need_x, 2 * self._nx)
+        new_nz = self._nz if 0 <= pz < self._nz else max(need_z, 2 * self._nz)
 
-        # Anchor the new box so the whole current box still fits inside it.
-        new_ox = min(lo_x, hi_x - new_nx + 1)
-        new_oz = min(lo_z, hi_z - new_nz + 1)
+        # Anchor the new box so the whole current box still fits inside it and
+        # the spare room lies on the side that grew: growing toward +x keeps the
+        # low edge, growing toward -x keeps the high edge.  (Centring the spare
+        # room the other way would re-trigger growth on every further step.)
+        new_ox = hi_x - new_nx + 1 if px < 0 else self._ox
+        new_oz = hi_z - new_nz + 1 if pz < 0 else self._oz
 
         owner = self._new_owner(new_nx, new_nz)
         kind = self._new_kind(new_nx, new_nz)
@@ -301,7 +315,10 @@ class Grid:
         exactly what negotiated-congestion routing does."""
         if not 0 <= y < self.height:
             return False
-        return self.kind_at(x, y, z) in (CellKind.FREE, CellKind.WIRE)
+        px, pz = x - self._ox, z - self._oz
+        if 0 <= px < self._nx and 0 <= pz < self._nz:
+            return int(self._kind[px, y, pz]) in _ROUTABLE
+        return True  # never-allocated space is free
 
     def neighbors(self, x: int, y: int, z: int) -> Iterator[tuple[int, int, int]]:
         """The routable six-connected cells adjacent to ``(x, y, z)`` -- the legal
@@ -313,7 +330,13 @@ class Grid:
                 yield (nx, ny, nz)
 
     def routing_cost(
-        self, x: int, y: int, z: int, *, present_factor: float = PRESENT_FACTOR
+        self,
+        x: int,
+        y: int,
+        z: int,
+        *,
+        present_factor: float = PRESENT_FACTOR,
+        net: int | None = None,
     ) -> float:
         """Cost of routing a net through this cell.
 
@@ -321,13 +344,22 @@ class Grid:
         *present* overuse (nets sharing the cell beyond :data:`CAPACITY`).
         Returns ``inf`` for cells a net may not use.  ``present_factor`` is
         raised by the router across iterations so temporary sharing is squeezed
-        out."""
+        out.
+
+        Without ``net`` the overuse is the cell's current state.  With ``net``
+        it is the overuse that WOULD result if that net used the cell (PathFinder
+        semantics): a cell held by one other net is already priced as shared,
+        while a cell ``net`` itself already holds (another branch of its own
+        tree) is not charged again."""
         if not self.is_routable(x, y, z):
             return math.inf
         idx = self._index(x, y, z)
         if idx is None:
             return BASE_COST  # pristine free space: base cost only
-        overuse = max(0, int(self._occupancy[idx]) - CAPACITY)
+        occupancy = int(self._occupancy[idx])
+        if net is not None and (x, y, z) not in self._net_cells.get(net, ()):
+            occupancy += 1
+        overuse = max(0, occupancy - CAPACITY)
         return (BASE_COST + float(self._history[idx])) * (1.0 + present_factor * overuse)
 
     def occupancy_at(self, x: int, y: int, z: int) -> int:
@@ -350,23 +382,32 @@ class Grid:
         Unlike :meth:`place`, this *allows overuse*: several nets may claim the
         same cell at once, and the rising congestion cost is what later drives
         them apart.  The claim is recorded per net so :meth:`rip_up_net` can undo
-        the whole route in one call."""
+        the whole route in one call.
+
+        Claims are idempotent per net: the branches of one fanout tree that share
+        a trunk occupy it as ONE net, so re-claiming a cell the net already holds
+        does not raise its occupancy again."""
         self._check_y(y)
         self._check_horizontal(x, z)
         if not self.is_routable(x, y, z):
             raise CompileError(
                 f"cannot route net {net} through blocked cell ({x}, {y}, {z})"
             )
+        cells = self._net_cells.setdefault(net, set())
+        if (x, y, z) in cells:
+            return
         self._ensure(x, z)
         px, pz = x - self._ox, z - self._oz
         self._occupancy[px, y, pz] += 1
-        self._net_cells.setdefault(net, set()).add((x, y, z))
+        cells.add((x, y, z))
         self._extend_used(x, z)
 
     def rip_up_net(self, net: int) -> None:
         """Free every cell ``net`` routes through -- the whole-net counterpart to
         :meth:`rip_up`, run each iteration before a net is rerouted against the
-        updated congestion costs."""
+        updated congestion costs.  Each cell is released exactly once (claims are
+        per-net sets).  Only working routes should be ripped up: cells already
+        made permanent by :meth:`commit_routes` keep their ``WIRE`` marking."""
         for x, y, z in self._net_cells.pop(net, set()):
             idx = self._index(x, y, z)
             if idx is not None:
@@ -391,6 +432,55 @@ class Grid:
             return
         overuse = np.maximum(0, self._occupancy - CAPACITY).astype(np.float32)
         self._history += increment * overuse
+
+    def max_occupancy(self) -> int:
+        """The most nets currently sharing any one cell (0 if none)."""
+        if self._nx == 0:
+            return 0
+        return int(self._occupancy.max(initial=0))
+
+    def congestion_stats(self) -> dict[str, float | int]:
+        """Grid-wide congestion summary: overused cell count, peak occupancy, and
+        how much history has accumulated (and over how many cells)."""
+        if self._nx == 0:
+            return {
+                "overused": 0,
+                "max_occupancy": 0,
+                "history_cells": 0,
+                "history_total": 0.0,
+                "history_max": 0.0,
+            }
+        return {
+            "overused": int(np.count_nonzero(self._occupancy > CAPACITY)),
+            "max_occupancy": int(self._occupancy.max(initial=0)),
+            "history_cells": int(np.count_nonzero(self._history > 0)),
+            "history_total": float(self._history.sum(dtype=np.float64)),
+            "history_max": float(self._history.max(initial=0.0)),
+        }
+
+    def commit_routes(self) -> int:
+        """Finalize the working routing: mark every claimed cell as permanent
+        ``WIRE`` owned by its net, so :meth:`to_dict` shows the routed layout.
+
+        Only a legal (capacity-respecting) routing may be committed; raises if
+        any cell is overused or a claimed cell belongs to something else.  The
+        per-net claim index is kept, so :meth:`route_of` still answers
+        afterwards.  Returns the number of cells committed."""
+        overused = self.overused()
+        if overused:
+            raise CompileError(f"cannot commit routes: {len(overused)} cells are overused")
+        committed = 0
+        for net in sorted(self._net_cells):
+            for x, y, z in sorted(self._net_cells[net]):
+                owner = self.owner_at(x, y, z)
+                own_wire = owner == net and self.kind_at(x, y, z) == CellKind.WIRE
+                if owner != EMPTY and not own_wire:
+                    raise CompileError(
+                        f"cannot commit net {net}: cell ({x}, {y}, {z}) is owned by {owner}"
+                    )
+                self._write(x, y, z, net, CellKind.WIRE)
+                committed += 1
+        return committed
 
     # -- introspection / trace --------------------------------------------
 

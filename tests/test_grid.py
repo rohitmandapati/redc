@@ -163,3 +163,74 @@ def test_history_accumulates_only_on_overused_cells() -> None:
     grid.claim(3, 5, 5, 5)
     grid.add_history()
     assert grid.history_at(5, 5, 5) == 0.0
+
+
+def test_reclaiming_a_cell_by_the_same_net_counts_once() -> None:
+    # A fanout tree's branches share a trunk: that trunk holds ONE net.
+    grid = Grid()
+    for _ in range(3):
+        grid.claim(7, 0, 0, 0)
+    grid.claim(7, 1, 0, 0)
+    assert grid.occupancy_at(0, 0, 0) == 1
+    assert grid.overused() == []
+    grid.rip_up_net(7)
+    assert grid.occupancy_at(0, 0, 0) == 0  # released exactly once
+    assert grid.occupancy_at(1, 0, 0) == 0
+    assert grid.max_occupancy() == 0
+
+
+def test_net_aware_cost_prices_the_sharing_that_would_result() -> None:
+    grid = Grid()
+    base = grid.routing_cost(0, 0, 0)
+    grid.claim(1, 0, 0, 0)
+    # For another net, using a cell net 1 holds would overuse it.
+    assert grid.routing_cost(0, 0, 0, net=2) > base
+    # For net 1 itself (another branch of its own tree) it is not shared.
+    assert grid.routing_cost(0, 0, 0, net=1) == base
+    # The net-less form keeps reporting the current state.
+    assert grid.routing_cost(0, 0, 0) == base
+
+
+def test_commit_routes_marks_wires_and_refuses_overuse() -> None:
+    grid = Grid()
+    grid.claim(1, 0, 0, 0)
+    grid.claim(1, 1, 0, 0)
+    grid.claim(2, 1, 0, 0)  # overused
+    with pytest.raises(CompileError, match="overused"):
+        grid.commit_routes()
+    grid.rip_up_net(2)
+    assert grid.commit_routes() == 2
+    assert grid.kind_at(0, 0, 0) == CellKind.WIRE
+    assert grid.owner_at(1, 0, 0) == 1
+    assert grid.route_of(1) == frozenset({(0, 0, 0), (1, 0, 0)})
+    kinds = {c["kind"] for c in grid.to_dict()["cells"]}
+    assert kinds == {int(CellKind.WIRE)}
+
+
+def test_congestion_stats_summarise_history() -> None:
+    grid = Grid()
+    assert grid.congestion_stats()["overused"] == 0
+    grid.claim(1, 0, 0, 0)
+    grid.claim(2, 0, 0, 0)
+    grid.add_history(increment=2.0)
+    stats = grid.congestion_stats()
+    assert stats["overused"] == 1
+    assert stats["max_occupancy"] == 2
+    assert stats["history_cells"] == 1
+    assert stats["history_max"] == 2.0
+
+
+def test_growth_along_one_axis_does_not_inflate_the_other() -> None:
+    # Regression: growing x used to double z as well (and anchor the spare room
+    # on the wrong side), so a design spreading east one column at a time grew
+    # the backing arrays exponentially.  Inspects private capacity on purpose.
+    grid = Grid(height=4)
+    for i in range(200):
+        grid.place(i * 6, 1, 0, owner=i)
+    assert grid._nz == 1
+    assert grid._nx <= 2 * (199 * 6 + 1)
+    for i in range(1, 100):
+        grid.place(0, 1, -i * 5, owner=1000 + i)  # now grow toward -z
+    assert grid._nz <= 2 * (99 * 5 + 1)
+    assert grid.owner_at(0, 1, 0) == 0 and grid.owner_at(1194, 1, 0) == 199
+    assert grid.owner_at(0, 1, -495) == 1099

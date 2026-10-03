@@ -43,6 +43,17 @@ mapping; placement and routing come next):
 uv run redc dump-netlist examples/uint8_fib.redc --top fib
 ```
 
+It then places and routes that netlist on a 3D grid of abstract cells, and
+writes a replay trace of the whole process with a browser viewer for it (see
+[docs/pnr-trace.md](docs/pnr-trace.md)):
+
+```bash
+uv run redc pnr examples/uint8_fib.redc --top fib
+# build/uint8_fib.pnr.json      replay trace (redc.pnr.trace.v1)
+# build/uint8_fib.pnr.html      3D replay viewer (open in a browser; loads Three.js from a CDN)
+# build/uint8_fib.physical.json final placed + routed design
+```
+
 - **Types:** the language accepts widths 1–64, but Minecraft supports only
   `bool`, `uint4/int4`, `uint8/int8`, `uint16/int16`, `uint32/int32` and
   `uint64/int64` (`is_supported_physical_type`).
