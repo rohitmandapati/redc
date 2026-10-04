@@ -70,6 +70,29 @@ uv run redc pnr examples/uint8_fib.redc --top fib
   annotations exist, `start` maps to a lever and a `uint8 result` to a two-digit
   seven-segment display (placeholder geometry); other ports use abstract pads.
 
+### Primitive (bit-level) physical backend
+
+`--backend physical-primitive` is a second, independent physical backend
+(`redc.physical_primitive`). Instead of one hand-made cell per wide operation,
+it bit-blasts EVERY operation -- add, mul, div, mod, shifts, comparisons,
+casts, muxes, registers -- into one-bit AND/OR/XOR/NOT gates and one-bit
+register bits, maps each onto a (placeholder) Minecraft cell, and places and
+routes every bit as its own redstone net at block resolution (one coordinate
+= one block), with repeater insertion and an independent electrical check:
+
+```bash
+uv run redc pnr examples/uint8_add.redc --top add --backend physical-primitive
+# build/uint8_add.primitive.pnr.json       replay trace (redc.physical-primitive.pnr.v1)
+# build/uint8_add.primitive.pnr.html       3D replay viewer
+# build/uint8_add.primitive.physical.json  final block-level design (redc.physical-primitive.v1)
+uv run redc dump-netlist examples/uint8_alu.redc --backend physical-primitive   # the one-bit netlist
+uv run redc physical-backends
+```
+
+Every IR width works here (`uint3` included). Circuits get very large; that is
+intentional. See [docs/physical-primitive.md](docs/physical-primitive.md) and
+[docs/physical-primitive-trace.md](docs/physical-primitive-trace.md).
+
 See `examples/` for sample programs.
 
 ## Roadmap

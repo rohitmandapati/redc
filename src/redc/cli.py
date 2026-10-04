@@ -100,13 +100,33 @@ def build(
 
 @app.command()
 def backends() -> None:
-    """List the available output backends."""
+    """List the available output backends (``redc build --backend``).
+
+    Place-and-route backends are a separate registry: see
+    ``redc physical-backends``."""
     from .backends import BACKENDS
 
     for name in available_backends():
         target = BACKENDS[name]
         default = " (default)" if name == DEFAULT_BACKEND else ""
         typer.echo(f"{name}{default}\t{target.extension}\t{target.summary}")
+
+
+@app.command("physical-backends")
+def physical_backends_command() -> None:
+    """List the physical place-and-route backends (``redc pnr --backend``)."""
+    from .physical_backends import (
+        DEFAULT_PHYSICAL_BACKEND,
+        available_physical_backends,
+        get_physical_backend,
+    )
+
+    for name in available_physical_backends():
+        backend = get_physical_backend(name)
+        default = " (default)" if name == DEFAULT_PHYSICAL_BACKEND else ""
+        typer.echo(
+            f"{name}{default}\t{backend.trace_schema}\t{backend.design_schema}\t{backend.summary}"
+        )
 
 
 @app.command()
@@ -148,28 +168,35 @@ def dump_ir(
     typer.echo(f"Wrote {output}")
 
 
-@app.command("dump-netlist")
-def dump_netlist(
-    source: SourcePath,
-    output: Annotated[
-        Path | None,
-        typer.Option(
-            "--output", "-o", help="Write JSON to this path instead of stdout."
-        ),
-    ] = None,
-    top: Annotated[str, typer.Option(help="Top-level RedC function.")] = "main",
-) -> None:
-    """Print or write the unplaced Minecraft PhysicalNetlist (debug view)."""
-    import json
+PhysicalBackendOption = Annotated[
+    str,
+    typer.Option(
+        "--backend",
+        "-b",
+        help="Physical backend: physical (coarse, default) or physical-primitive "
+        "(see `redc physical-backends`).",
+    ),
+]
+InterfaceOption = Annotated[
+    str | None,
+    typer.Option(
+        help="physical-primitive only: port realization, 'default' (lever / display "
+        "peripherals where applicable) or 'pads' (one pad per bit)."
+    ),
+]
 
-    from .physical import lower_to_physical
 
-    graph = _compile(source, top, Limits())
+def _physical_backend(name: str):
+    from .physical_backends import get_physical_backend
+
     try:
-        payload = json.dumps(lower_to_physical(graph).to_dict(), indent=2) + "\n"
+        return get_physical_backend(name)
     except CompileError as error:
         typer.echo(f"redc: {error}", err=True)
         raise typer.Exit(code=1) from error
+
+
+def _emit_json(payload: str, output: Path | None) -> None:
     if output is None:
         typer.echo(payload, nl=False)
         return
@@ -182,20 +209,82 @@ def dump_netlist(
     typer.echo(f"Wrote {output}")
 
 
+@app.command("dump-netlist")
+def dump_netlist(
+    source: SourcePath,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output", "-o", help="Write JSON to this path instead of stdout."
+        ),
+    ] = None,
+    top: Annotated[str, typer.Option(help="Top-level RedC function.")] = "main",
+    backend: PhysicalBackendOption = "physical",
+    stage: Annotated[
+        str | None,
+        typer.Option(
+            help="Netlist stage. physical: 'physical' (default). physical-primitive: "
+            "'primitive' (technology-neutral one-bit netlist, default) or 'mapped' "
+            "(technology-mapped, unplaced)."
+        ),
+    ] = None,
+    interface: InterfaceOption = None,
+) -> None:
+    """Print or write a physical backend's unplaced netlist (debug view).
+
+    ``--backend physical`` dumps the coarse PhysicalNetlist (wide components,
+    bus nets).  ``--backend physical-primitive`` dumps the technology-neutral
+    one-bit PrimitiveNetlist (``redc.primitive-netlist.v1``), or with
+    ``--stage mapped`` the Minecraft-technology-mapped version."""
+    import json
+
+    target = _physical_backend(backend)
+    graph = _compile(source, top, Limits())
+    try:
+        payload = json.dumps(target.dump_netlist(graph, stage=stage, interface=interface), indent=2) + "\n"
+    except CompileError as error:
+        typer.echo(f"redc: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    _emit_json(payload, output)
+
+
+@app.command("dump-primitive-netlist")
+def dump_primitive_netlist(
+    source: SourcePath,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write JSON to this path instead of stdout."),
+    ] = None,
+    top: Annotated[str, typer.Option(help="Top-level RedC function.")] = "main",
+    stage: Annotated[
+        str, typer.Option(help="'primitive' (technology-neutral, default) or 'mapped'.")
+    ] = "primitive",
+    interface: InterfaceOption = None,
+) -> None:
+    """Shorthand for ``dump-netlist --backend physical-primitive``."""
+    dump_netlist(source, output=output, top=top, backend="physical-primitive", stage=stage, interface=interface)
+
+
 @app.command()
 def pnr(
     source: SourcePath,
     top: Annotated[str, typer.Option(help="Top-level RedC function.")] = "main",
+    backend: PhysicalBackendOption = "physical",
     output: Annotated[
         Path | None,
         typer.Option(
-            "--output", "-o", help="Final placed/routed design JSON (default build/<name>.physical.json)."
+            "--output",
+            "-o",
+            help="Final placed/routed design JSON (default build/<name>.physical.json; "
+            "physical-primitive: build/<name>.primitive.physical.json).",
         ),
     ] = None,
     trace_path: Annotated[
         Path | None,
         typer.Option(
-            "--trace", help="Replay trace path, .pnr.json or .pnr.jsonl (default build/<name>.pnr.json)."
+            "--trace",
+            help="Replay trace path, .json or .jsonl (default build/<name>.pnr.json; "
+            "physical-primitive: build/<name>.primitive.pnr.json).",
         ),
     ] = None,
     trace_level: Annotated[
@@ -204,55 +293,91 @@ def pnr(
     viewer: Annotated[
         bool, typer.Option("--viewer/--no-viewer", help="Also write the 3D replay viewer HTML.")
     ] = True,
-    grid_height: Annotated[int, typer.Option(min=1, help="Grid height in cells.")] = 24,
+    grid_height: Annotated[
+        int | None, typer.Option(min=1, help="physical only: grid height in cells [24].")
+    ] = None,
     spacing: Annotated[
-        int, typer.Option(min=0, help="Free cells between components in a layer.")
-    ] = 3,
-    layer_gap: Annotated[int, typer.Option(min=0, help="Free cells between layers.")] = 4,
+        int | None,
+        typer.Option(
+            min=0,
+            help="Free space between neighbouring components in a column "
+            "[physical: 3 cells; physical-primitive: 1 block beyond keep-outs].",
+        ),
+    ] = None,
+    layer_gap: Annotated[
+        int | None, typer.Option(min=0, help="physical only: free cells between layers [4].")
+    ] = None,
+    channel_width: Annotated[
+        int | None,
+        typer.Option(min=0, help="physical-primitive only: free blocks between placement columns [6]."),
+    ] = None,
+    max_height: Annotated[
+        int | None,
+        typer.Option(min=3, help="physical-primitive only: highest block y routes may use [9]."),
+    ] = None,
     routing_margin: Annotated[
-        int, typer.Option(min=0, help="Routing search margin around the design.")
-    ] = 4,
+        int | None,
+        typer.Option(
+            min=0, help="Routing search margin around the design [physical: 4 cells; physical-primitive: 6 blocks]."
+        ),
+    ] = None,
     max_route_iterations: Annotated[
-        int, typer.Option(min=0, help="Negotiated-congestion iterations.")
-    ] = 40,
+        int | None,
+        typer.Option(min=0, help="Negotiated-congestion iterations [physical: 40; physical-primitive: 30]."),
+    ] = None,
     max_attempts: Annotated[
-        int, typer.Option(min=1, help="Place-and-route attempts (each spreads wider).")
-    ] = 4,
+        int | None,
+        typer.Option(
+            min=1, help="Place-and-route attempts, each spreads wider [physical: 4; physical-primitive: 3]."
+        ),
+    ] = None,
+    interface: InterfaceOption = None,
 ) -> None:
-    """Compile SOURCE, tech-map it, then place and route it in 3D.
+    """Compile SOURCE, lower it with the chosen physical backend, then place
+    and route it in 3D.
+
+    ``--backend physical`` (default) uses the coarse component backend;
+    ``--backend physical-primitive`` bit-blasts everything into one-bit gates
+    and routes every bit as its own redstone net at block resolution.
 
     Always writes the replay trace -- also when P&R fails (exit code 1)."""
     import json
 
-    from .physical import lower_to_physical
-    from .physical.pnr import PnRConfig, TraceLevel, TraceRecorder, place_and_route
-    from .viewer import write_pnr_html
+    from .physical_backends import PnROptions, check_options
 
-    graph = _compile(source, top, Limits())
-    stem = source.stem
-    trace_path = trace_path or Path("build") / f"{stem}.pnr.json"
-    output = output or Path("build") / f"{stem}.physical.json"
+    target = _physical_backend(backend)
+    options = PnROptions(
+        trace_level=trace_level,
+        spacing=spacing,
+        routing_margin=routing_margin,
+        max_route_iterations=max_route_iterations,
+        max_attempts=max_attempts,
+        grid_height=grid_height,
+        layer_gap=layer_gap,
+        max_height=max_height,
+        channel_width=channel_width,
+        interface=interface,
+    )
     try:
-        config = PnRConfig(
-            grid_height=grid_height,
-            base_y=min(PnRConfig.base_y, grid_height - 1),
-            component_spacing=spacing,
-            layer_gap=layer_gap,
-            routing_margin=routing_margin,
-            max_routing_iterations=max_route_iterations,
-            max_pnr_attempts=max_attempts,
-            trace_level=TraceLevel.parse(trace_level),
-        )
-        netlist = lower_to_physical(graph)
+        check_options(target, options)
+    except CompileError as error:
+        typer.echo(f"redc: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    graph = _compile(source, top, Limits())
+    paths = target.default_paths(source.stem)
+    trace_path = trace_path or paths.trace
+    output = output or paths.output
+    try:
+        prepared = target.prepare(graph, options, source=source, top=top)
     except CompileError as error:
         typer.echo(f"redc: {error}", err=True)
         raise typer.Exit(code=1) from error
 
-    recorder = TraceRecorder(config.trace_level)
-    result = None
+    recorder = prepared.recorder
+    run = None
     compile_error: CompileError | None = None
     try:
-        result = place_and_route(netlist, config, trace=recorder)
+        run = target.run(prepared)
     except CompileError as error:
         recorder.fail(str(error))
         compile_error = error
@@ -263,59 +388,66 @@ def pnr(
         try:
             recorder.write(trace_path)
             typer.echo(f"Wrote {trace_path} (replay trace, {len(recorder.events)} events)")
-            if viewer:
-                html_path = trace_path.with_name(trace_path.name.split(".")[0] + ".pnr.html")
-                write_pnr_html(recorder.to_dict(), html_path, title=f"RedC P&R - {source.name}")
-                typer.echo(f"Wrote {html_path} (3D replay viewer)")
         except (CompileError, OSError) as error:
             typer.echo(f"redc: could not write the trace: {error}", err=True)
+        else:
+            if viewer:
+                html_path = target.viewer_path(trace_path)
+                title = f"RedC P&R - {source.name}" if target.name == "physical" else (
+                    f"RedC {target.name} P&R - {source.name}"
+                )
+                try:
+                    target.write_viewer(recorder.to_dict(), html_path, title=title)
+                    typer.echo(f"Wrote {html_path} (3D replay viewer)")
+                except (CompileError, OSError) as error:
+                    typer.echo(f"redc: could not write the viewer: {error}", err=True)
 
     if compile_error is not None:
         typer.echo(f"redc: {compile_error}", err=True)
         raise typer.Exit(code=1) from compile_error
-    assert result is not None
-    if not result.success:
-        failure = result.failure
+    assert run is not None
+    if not run.success:
         typer.echo(
-            f"redc: place-and-route failed after {result.attempts} attempt(s): "
-            f"{failure.message if failure else 'unknown failure'}",
+            f"redc: place-and-route failed after {run.attempts} attempt(s): {run.failure}",
             err=True,
         )
         raise typer.Exit(code=1)
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(result.to_physical_dict(), indent=1) + "\n", encoding="utf-8")
+        output.write_text(json.dumps(run.design, indent=1) + "\n", encoding="utf-8")
     except OSError as error:
         typer.echo(f"redc: {error}", err=True)
         raise typer.Exit(code=1) from error
-    metrics = result.metrics
-    bounds = metrics["final"]["bounds"]
     typer.echo(f"Wrote {output} (placed and routed design)")
-    typer.echo(
-        f"P&R: {metrics['placement']['component_count']} components, "
-        f"{metrics['routing']['routed_nets']} nets, {metrics['routing']['wire_cells']} wire cells, "
-        f"{metrics['routing']['iterations']} routing iteration(s), attempt {result.geometry.attempt}, "
-        f"bounds {bounds['dims'] if bounds else '-'}"
-    )
+    typer.echo(run.summary)
 
 
 @app.command("render-pnr")
 def render_pnr(
     trace: Annotated[
         Path,
-        typer.Argument(exists=True, dir_okay=False, readable=True, help="A .pnr.json / .pnr.jsonl trace."),
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="A coarse (.pnr.json / .pnr.jsonl) or primitive (.primitive.pnr.json) trace.",
+        ),
     ],
     output: Annotated[
         Path | None,
         typer.Option("--output", "-o", help="HTML path (default: next to the trace)."),
     ] = None,
 ) -> None:
-    """Write a self-contained 3D replay viewer page for a P&R trace."""
-    from .viewer import write_pnr_html
+    """Write a self-contained 3D replay viewer page for a P&R trace of either
+    physical backend (chosen from the trace's schema)."""
+    from .physical_backends import get_physical_backend
+    from .viewer import load_any_trace, trace_backend, write_trace_html
 
-    output = output or trace.with_name(trace.name.split(".")[0] + ".pnr.html")
     try:
-        write_pnr_html(trace, output)
+        data = load_any_trace(trace)
+        if output is None:
+            output = get_physical_backend(trace_backend(data)).viewer_path(trace)
+        write_trace_html(data, output, title=f"RedC P&R replay - {trace.name}")
     except (CompileError, OSError, ValueError) as error:
         typer.echo(f"redc: {error}", err=True)
         raise typer.Exit(code=1) from error

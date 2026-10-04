@@ -12,7 +12,9 @@ implementations exist for this exactly-typed operation?".
   different keys even if one cell could serve both, and
   ``shr(int8, uint64) -> int8`` (arithmetic) is distinct from
   ``shr(uint8, uint64) -> uint8`` (logical).  Casts are keyed by their full
-  source and destination types, never by widths alone.
+  source and destination types, never by widths alone.  The class itself is
+  target-neutral and lives in :mod:`redc.signature` (shared with the
+  ``physical-primitive`` backend); it is re-exported here unchanged.
 * :class:`PhysicalImplementation` -- the candidate protocol.  Two kinds exist:
 
   - :class:`DirectCellImplementation` -- exactly one library
@@ -43,67 +45,23 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from ..ir import BOOL, OPS, Graph, IRType, check_operation_types
+from ..ir import IRType
 from ..parser import CompileError
+from ..signature import REGISTER_OP, OperationSignature
 
 if TYPE_CHECKING:
     from .components import Component
 
-#: Signature op of a state element (the IR ``register`` node).  IR operations
-#: are type-checked by the IR's own rules; other physical-only op names (gates
-#: such as ``nand`` that a composite recipe may target) are free-form.
-REGISTER_OP = "register"
-
-
-@dataclass(frozen=True, slots=True)
-class OperationSignature:
-    """An operation together with its exact result and operand types.
-
-    Operand order is the IR argument order (``mux`` = select, yes, no; shifts =
-    value, amount; ``register`` = next, enable).  IR operations are checked with
-    :func:`redc.ir.check_operation_types`, so a signature can never claim a
-    typing the IR itself would reject (e.g. a one-input shift).
-    """
-
-    op: str
-    result_type: IRType
-    operand_types: tuple[IRType, ...]
-
-    def __post_init__(self) -> None:
-        if not self.op:
-            raise CompileError("operation signature needs an op")
-        if self.op == "cast":
-            if len(self.operand_types) != 1:
-                raise CompileError("cast signature takes exactly one operand")
-        elif self.op in OPS:
-            check_operation_types(self.op, self.result_type, self.operand_types)
-        elif self.op == REGISTER_OP and self.operand_types != (self.result_type, BOOL):
-            raise CompileError(
-                "register signature must be register(T next, bool enable) -> T"
-            )
-
-    @classmethod
-    def of(cls, op: str, result_type: IRType, *operand_types: IRType) -> OperationSignature:
-        return cls(op, result_type, tuple(operand_types))
-
-    @classmethod
-    def from_ir_node(cls, graph: Graph, node: dict[str, Any]) -> OperationSignature:
-        """The signature of one IR operation node (not a traversal: the caller
-        decides which nodes to ask about, and must only ask about live ones).
-
-        ``input``/``const`` nodes are boundary cells built on demand, not library
-        operations, so they have no signature."""
-        if node["op"] in {"input", "const"}:
-            raise CompileError(f"{node['op']} nodes are boundary cells, not operations")
-        return cls(
-            node["op"],
-            IRType(**node["type"]),
-            tuple(IRType(**graph.nodes[arg]["type"]) for arg in node["args"]),
-        )
-
-    def __str__(self) -> str:
-        operands = ", ".join(t.name for t in self.operand_types)
-        return f"{self.op}({operands}) -> {self.result_type.name}"
+__all__ = [
+    "REGISTER_OP",
+    "CompositeImplementation",
+    "DirectCellImplementation",
+    "ImplementationRegistry",
+    "OperationSignature",
+    "PhysicalImplementation",
+    "Recipe",
+    "RecipeBuilder",
+]
 
 
 class PhysicalImplementation(Protocol):

@@ -3,42 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
 from typing import Any
 
 from ...parser import CompileError
+from ...tracing import TraceLevel
 from ..grid import MAX_HEIGHT
 
-
-class TraceLevel(IntEnum):
-    """How much of the P&R process the replay trace records.
-
-    * ``NONE``     -- header and final state only, no events;
-    * ``BASIC``    -- attempts, placements, every committed / ripped-up route,
-      routing iterations and congestion snapshots (the default, compact);
-    * ``DETAILED`` -- also each placement probe and every routed branch;
-    * ``SEARCH``   -- also every A* node expansion (large: for visualizing the
-      router "thinking").
-    """
-
-    NONE = 0
-    BASIC = 1
-    DETAILED = 2
-    SEARCH = 3
-
-    @property
-    def label(self) -> str:
-        return self.name.lower()
-
-    @classmethod
-    def parse(cls, value: str | int) -> TraceLevel:
-        if isinstance(value, int):
-            return cls(value)
-        try:
-            return cls[value.upper()]
-        except KeyError:
-            choices = ", ".join(level.label for level in cls)
-            raise CompileError(f"unknown trace level {value!r}; use one of {choices}") from None
+__all__ = ["AttemptGeometry", "PnRConfig", "TraceLevel"]
 
 
 @dataclass(frozen=True)
