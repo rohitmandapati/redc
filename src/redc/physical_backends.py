@@ -48,6 +48,9 @@ class PnROptions:
     max_height: int | None = None
     channel_width: int | None = None
     interface: str | None = None
+    clock_period: int | None = None
+    clock_margin: int | None = None
+    max_clock_skew: int | None = None
 
     def given(self) -> dict[str, Any]:
         """Every explicitly set option except the trace level."""
@@ -127,6 +130,9 @@ OPTION_FLAGS = {
     "max_height": "--max-height",
     "channel_width": "--channel-width",
     "interface": "--interface",
+    "clock_period": "--clock-period",
+    "clock_margin": "--clock-margin",
+    "max_clock_skew": "--max-clock-skew",
 }
 
 

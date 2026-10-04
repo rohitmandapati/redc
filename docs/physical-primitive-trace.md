@@ -82,7 +82,15 @@ node 42, a uint8 add, bit 5, carry-generation logic"; walk `groups` from
 {
   "name": "xor_gate_2x3_placeholder", "kind": "xor",
   "placeholder": true, "structure": null,      // EVERY v1 cell is a placeholder
-  "latency": 3, "stateful": false, "description": "...",
+  "latency": 3,                                // display summary only (redstone ticks)
+  "timing": {                                  // AUTHORITATIVE (redc-redstone-timing-v1), or null if unknown
+    "model": "redc-redstone-timing-v1", "source": "declared",   // or "characterized"
+    "arcs": [{"from_pin": "a", "to_pin": "y", "min_delay": {"gt": 6, "rt": 3}, "max_delay": {"gt": 6, "rt": 3}}, ...],
+    "sequential": null                         // registers: {clock_pin, data_pin, q_pin, reset_pin,
+  },                                           //   clk_to_q_min/max, setup, hold, reset_to_q, recovery}
+  "materialized": false,                       // true: "structure_blocks" lists its real blocks
+  "structure_blocks": null,                    // [{coord, block: "minecraft:repeater[delay=1,facing=west]"}]
+  "stateful": false, "description": "...",
   "orientations": ["east", "south", "west", "north"],
   "peripheral": null,                          // or {kind, direction, width}
   "voxels": [{"coord": [0,0,0], "role": "base"}, {"coord": [1,1,0], "role": "body"}, ...],
@@ -103,7 +111,8 @@ drive there (0 = never powered, e.g. constant 0); inputs the minimum they need.
 ## Events
 
 Every event has a contiguous `seq`, a `phase` (`synthesis`, `techmap`, `pnr`,
-`placement`, `routing`, `congestion`, `legalization`, `finalize`) and a `type`.
+`placement`, `routing`, `congestion`, `legalization`, `timing`, `simulation`,
+`finalize`) and a `type`.
 **Level** is the lowest trace level that records it (`none` records no events).
 
 | Type | Phase | Level | Payload |
@@ -151,6 +160,14 @@ Every event has a contiguous `seq`, a `phase` (`synthesis`, `techmap`, `pnr`,
 | `route_realized` | legalization | basic | a realized route (below) |
 | `legalization_complete` | legalization | basic | `round`, `realized`, `failures`, `repeaters` |
 | `illegal_transition` | legalization | basic | independent verification found a violation: `kind`, `message`, `cells`, `nets` |
+| `clock_tree_analyzed` | timing | basic | `net`, `sinks: [{instance, pin, coord, arrival}]`, `skew` — the routed clock net's physical arrival at every register clock pin (the repeater delays on its tree path; every duration is `{gt, rt}`) |
+| `clock_balanced` | timing | basic | `net`, `success`, `message`, `sinks`, `skew_before`, `skew_after`, `arrival_max`, `changes: [{coord, change ("raise_delay" / "dust_to_repeater"), from_rt, to_rt, added_rt}]`, `repeaters_added`, `repeaters_raised`, `delay_added_rt`, `realized` — the clock route after physical balancing; **replaces** the clock net's realized route |
+| `clock_balance_failed` | timing | basic | `net`, `message` — no assignment of repeater delays balances the tree (the attempt may be retried wider) |
+| `timing_analyzed` | timing | basic | `sequential`, `passed`; sequential: `period`, `mode` (`auto`/`user`), `skew`, `arrival_max`, `worst_setup_slack`, `worst_hold_slack`; combinational: `settle` |
+| `timing_closed` | timing | basic | as `timing_analyzed` (closure passed) |
+| `timing_failed` | timing | basic | `failures: [{code, message}]` (`timing/setup`, `timing/hold`, `timing/clock_skew`, `timing/clock_pulse`, ...) |
+| `simulation_validated` | simulation | basic | `mode` (`abstract-components` / `block-accurate`), `validated`, `vectors` or `transactions_run` + `cycles`, `sim_events`, `simulated_ticks_gt`, `failures` |
+| `simulation_failed` | simulation | basic | as `simulation_validated`, with the `failures` (`simulation/logic_mismatch`, `simulation/cycle_mismatch`, ...) |
 | `design_finalized` | finalize | basic | `attempt`, `nets`, `dust`, `repeaters`, `supports`, `bounds` |
 | `pnr_attempt_end` | pnr | basic | `attempt`, `status` (`success`/`failed`), `failure`, `metrics` |
 | `pnr_end` | pnr | basic | `success`, `attempts` |
@@ -170,14 +187,15 @@ from `root` outward; `cells` is the union in construction order.
 
 ### Realized route
 
-`{net, powered, elements: [{coord, kind: "dust"|"repeater", parent, strength, delay, facing?, blockstate_facing?}], repeaters, supports, clearances, sinks: [{instance, pin, coord, strength, required, repeaters, delay_ticks, distance}], min_strength, max_delay_ticks}`.
+`{net, powered, elements: [{coord, kind: "dust"|"repeater", parent, strength, delay, facing?, blockstate_facing?, repeater_delay?}], repeaters, supports, clearances, sinks: [{instance, pin, coord, strength, required, repeaters, delay_ticks, distance}], min_strength, max_delay_ticks}`.
 A dust element's `strength` is its signal strength (15 next to the driver,
 minus one per dust block); a repeater's is its input strength and its `facing`
 is the direction it outputs to — Minecraft's `minecraft:repeater[facing=...]` blockstate names the opposite (input) side, given as `blockstate_facing`. `parent` gives direction. `supports` are the
 blocks under the route's dust/repeaters (pins rest on their cell) and must be full opaque
 redstone conductors such as `minecraft:stone` (on glass a staircase only carries signal up);
-`clearances` must stay air so staircases connect. `delay` / `delay_ticks`
-count repeater redstone ticks from the root.
+`clearances` must stay air so staircases connect. A repeater's `repeater_delay`
+is its own setting (1..4 redstone ticks: 1 from legalization, up to 4 after
+clock balancing); `delay` / `delay_ticks` sum the settings from the root.
 
 ### Replaying
 
@@ -199,7 +217,8 @@ Apply events `0 .. N-1` in order:
   `branch_search_relaxed`, `branch_path_rejected`, `branch_route_found`,
   `branch_route_failed`, `net_route_restarted` and `net_route_committed`.
 - `congestion_snapshot` replaces the congestion layer.
-- `route_realized` replaces a net's realized (dust/repeater) route.
+- `route_realized` replaces a net's realized (dust/repeater) route;
+  `clock_balanced` replaces the clock net's (its `realized`).
 - `keyframe` replaces placement, all routes, all realized routes and the
   congestion layer, so seeking can restart from it.
 
@@ -210,16 +229,33 @@ After all events the state matches `final`.
 ```jsonc
 {
   "success": true, "attempt": 0, "attempts": 1,
-  "geometry": {"attempt": 0, "component_spacing": 1, "channel_width": 6, "routing_margin": 6, "max_y": 9},
-  "failure": null,      // or {stage, reason, message, attempt, attempts, net, iteration, details}
+  "geometry": {"attempt": 0, "component_spacing": 1, "channel_width": 6, "routing_margin": 6, "max_y": 9, "clock_tap": 4},
+  "failure": null,      // or {code ("stage/reason"), retryable, stage, reason, message, attempt, attempts,
+                        //     net, iteration, details}
   "placement": [{"instance": 0, "origin": [x,y,z], "orientation": "east", "bounds": {...}}],
   "routes": [route, ...], "realized": [realized route, ...],
   "conflicts": [],      // remaining conflicts (failure only)
   "violations": [],     // verifier findings (verification failure only)
+  "clock_tree": {...},  // balancing record (see clock_balanced) or null
+  "timing": {...},      // the timing report (docs/minecraft-timing.md) or null if the run stopped earlier
+  "simulation": {...},  // the redstone-simulation validation record or null
+  "simulation_playback": {   // a short recorded simulation for the viewer, or null
+    "model": "redc-redstone-sim-v1", "mode": "abstract-components", "start_gt": 400, "end_gt": 572, "cycles": 2,
+    "truncated": false,
+    "initial_dust": [[x, y, z, strength], ...], "initial_devices": [[x, y, z, on], ...],
+    "dust": [[t, x, y, z, strength], ...], "devices": [[t, x, y, z, on], ...],
+    "marks": [{"t": 402, "type": "clock_edge", "port": "clk", "edge": "rise"}, ...]
+  },
   "design_bounds": {...}, "search_bounds": {...},
   "metrics": {...}
 }
 ```
+
+Failure stages beyond the P&R ones: `timing` (`clock_balance` -- retried
+wider -- `setup`, `hold`, `clock_skew`, `clock_pulse`, `clock_unreached`,
+`data_reaches_clock`, ...) and `simulation` (`logic_mismatch`,
+`cycle_mismatch`, `timing_violation`, `weak_signal`, `unstable`,
+`unsupported_block`).  Only retryable failures start another attempt.
 
 A failed run still writes a complete trace with `success: false` — every
 attempt that ran, its last placement, routes and remaining congestion. If

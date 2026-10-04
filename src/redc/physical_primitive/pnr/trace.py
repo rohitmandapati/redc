@@ -54,6 +54,8 @@ PHASES = (
     "routing",
     "congestion",
     "legalization",
+    "timing",
+    "simulation",
     "finalize",
 )
 

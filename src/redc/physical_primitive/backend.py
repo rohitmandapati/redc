@@ -109,8 +109,9 @@ class PrimitivePhysicalBackend:
     design_schema = PHYSICAL_SCHEMA
     netlist_stages: tuple[str, ...] = ("primitive", "mapped")
     options = frozenset(
-        {"spacing", "routing_margin", "max_route_iterations", "max_attempts", "max_height", "channel_width", "interface"}
-    )
+        {"spacing", "routing_margin", "max_route_iterations", "max_attempts", "max_height", "channel_width", "interface",
+         "clock_period", "clock_margin", "max_clock_skew"}
+    )  # fmt: skip
 
     def default_paths(self, stem: str) -> PnRPaths:
         return PnRPaths(
@@ -151,6 +152,9 @@ class PrimitivePhysicalBackend:
                 else options.max_route_iterations
             ),
             max_pnr_attempts=defaults.max_pnr_attempts if options.max_attempts is None else options.max_attempts,
+            clock_period_rt=options.clock_period,
+            clock_margin_rt=defaults.clock_margin_rt if options.clock_margin is None else options.clock_margin,
+            max_clock_skew_rt=defaults.max_clock_skew_rt if options.max_clock_skew is None else options.max_clock_skew,
             trace_level=options.trace_level,  # type: ignore[arg-type]  # parsed in __post_init__
         )
         recorder = PrimitiveTraceRecorder(config.trace_level)
@@ -172,12 +176,22 @@ class PrimitivePhysicalBackend:
             return PnRRun(False, result.attempts, failure.message if failure else "unknown failure", None, "")
         m = result.metrics
         bounds = m["final"]["bounds"]
+        timing = m["timing"]
+        if timing.get("clock_period_rt") is not None:
+            clock = (
+                f"clock {timing['clock_period_rt']} rt ({timing['clock_mode']}), skew {timing['clock_skew_rt']} rt, "
+                f"worst setup slack {timing['worst_setup_slack_gt']} gt, hold {timing['worst_hold_slack_gt']} gt"
+            )
+        else:
+            clock = f"combinational settle {timing.get('combinational_settle_gt')} gt"
         summary = (
             f"P&R: {m['techmap']['components']} cells ({m['logical']['primitive_gates']} gates, "
             f"{m['logical']['register_bits']} register bits), {m['routing']['routed_nets']} one-bit nets, "
             f"{m['routing']['dust_blocks']} dust + {m['routing']['repeaters']} repeaters, "
             f"{m['routing']['iterations']} routing iteration(s), {m['routing']['rip_ups']} rip-up(s), "
-            f"attempt {result.geometry.attempt}, bounds {bounds['dims'] if bounds else '-'} blocks"
+            f"attempt {result.geometry.attempt}, bounds {bounds['dims'] if bounds else '-'} blocks\n"
+            f"Timing: {clock}; redstone simulation ({timing.get('simulation_mode')}) "
+            f"{'validated' if timing.get('simulation_validated') else 'NOT validated'}"
         )
         return PnRRun(True, result.attempts, None, result.to_design_dict(), summary)
 

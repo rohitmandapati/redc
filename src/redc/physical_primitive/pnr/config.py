@@ -26,6 +26,8 @@ class AttemptGeometry:
     channel_width: int
     routing_margin: int
     max_y: int
+    #: Length of the straight run reserved in front of every clock sink pin.
+    clock_tap: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +36,7 @@ class AttemptGeometry:
             "channel_width": self.channel_width,
             "routing_margin": self.routing_margin,
             "max_y": self.max_y,
+            "clock_tap": self.clock_tap,
         }
 
 
@@ -100,12 +103,33 @@ class PrimitivePnRConfig:
     retry_channel_growth: int = 3
     retry_margin_growth: int = 3
     retry_height_growth: int = 2
+    #: Clock taps: a straight, level run of this many blocks reserved in front
+    #: of every register clock pin, so clock-tree balancing always has
+    #: exclusive repeater sites on each sink's branch; grows per retry.
+    clock_tap_length: int = 4
+    retry_clock_tap_growth: int = 2
     #: Replay-trace verbosity.
     trace_level: TraceLevel = TraceLevel.BASIC
     #: Emit a full ``keyframe`` every N routing iterations (0 = never).
     keyframe_interval: int = 0
     #: SEARCH-level cap on ``route_transition_blocked`` events per branch.
     max_blocked_events_per_branch: int = 64
+    #: Timing closure (redstone ticks).  ``None`` = choose the smallest safe
+    #: period automatically (+ margin); a given period is checked, never raised.
+    clock_period_rt: int | None = None
+    clock_margin_rt: int = 1
+    #: Largest clock skew accepted (0: every register sees the edge at once).
+    max_clock_skew_rt: int = 0
+    #: ``required``: a design only succeeds if the redstone simulation at the
+    #: chosen clock agrees with the primitive simulator; ``off`` skips it
+    #: (the report then says ``validated: false``).
+    simulation_validation: str = "required"
+    #: Combinational designs: input vectors (exhaustive if they fit).
+    validation_vectors: int = 16
+    #: Sequential designs: transactions of at most ``validation_cycles`` cycles.
+    validation_transactions: int = 2
+    validation_cycles: int = 24
+    validation_seed: int = 0
 
     def __post_init__(self) -> None:
         if not 3 <= self.max_y < WORLD_HEIGHT:
@@ -115,8 +139,10 @@ class PrimitivePnRConfig:
             "max_path_retries", "search_lookback", "branch_effort", "max_sink_order_restarts",
             "max_legalization_rounds", "abort_divergence_margin", "abort_stagnation_iterations",
             "attempt_effort_per_net", "attempt_effort_min", "retry_spacing_growth",
-            "retry_channel_growth", "retry_margin_growth", "retry_height_growth",
-            "keyframe_interval", "max_blocked_events_per_branch",
+            "retry_channel_growth", "retry_margin_growth", "retry_height_growth", "clock_tap_length",
+            "retry_clock_tap_growth",
+            "keyframe_interval", "max_blocked_events_per_branch", "clock_margin_rt", "max_clock_skew_rt",
+            "validation_vectors", "validation_transactions", "validation_cycles", "validation_seed",
         ):  # fmt: skip
             if getattr(self, name) < 0:
                 raise CompileError(f"{name} must be non-negative")
@@ -130,6 +156,10 @@ class PrimitivePnRConfig:
             raise CompileError("abort_divergence_factor must be non-negative")
         if self.history_increment < 0 or self.vertical_cost < 0:
             raise CompileError("history_increment and vertical_cost must be non-negative")
+        if self.clock_period_rt is not None and self.clock_period_rt < 2:
+            raise CompileError("clock_period_rt must be at least 2 redstone ticks (or None for automatic)")
+        if self.simulation_validation not in ("required", "off"):
+            raise CompileError("simulation_validation must be 'required' or 'off'")
         object.__setattr__(self, "trace_level", TraceLevel.parse(self.trace_level))
 
     def attempt_geometry(self, attempt: int) -> AttemptGeometry:
@@ -140,6 +170,7 @@ class PrimitivePnRConfig:
             channel_width=self.channel_width + attempt * self.retry_channel_growth,
             routing_margin=self.routing_margin + attempt * self.retry_margin_growth,
             max_y=min(WORLD_HEIGHT - 1, self.max_y + attempt * self.retry_height_growth),
+            clock_tap=self.clock_tap_length + attempt * self.retry_clock_tap_growth if self.clock_tap_length else 0,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -173,9 +204,19 @@ class PrimitivePnRConfig:
             "retry_channel_growth": self.retry_channel_growth,
             "retry_margin_growth": self.retry_margin_growth,
             "retry_height_growth": self.retry_height_growth,
+            "clock_tap_length": self.clock_tap_length,
+            "retry_clock_tap_growth": self.retry_clock_tap_growth,
             "trace_level": self.trace_level.label,
             "keyframe_interval": self.keyframe_interval,
             "max_blocked_events_per_branch": self.max_blocked_events_per_branch,
+            "clock_period_rt": self.clock_period_rt,
+            "clock_margin_rt": self.clock_margin_rt,
+            "max_clock_skew_rt": self.max_clock_skew_rt,
+            "simulation_validation": self.simulation_validation,
+            "validation_vectors": self.validation_vectors,
+            "validation_transactions": self.validation_transactions,
+            "validation_cycles": self.validation_cycles,
+            "validation_seed": self.validation_seed,
         }
 
 

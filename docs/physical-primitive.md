@@ -13,8 +13,17 @@ RedC source
   -> PlacedPrimitiveDesign                 placement
   -> RoutedPrimitiveDesign                 single-bit routing
   -> LegalizedPrimitiveDesign              redstone electrical legalization
+  -> MinecraftPhysicalDesign               materialized blocks (redc.minecraft, backend-neutral)
+  -> clock-tree balancing, static timing analysis, automatic clock period
+  -> redstone simulation at that clock     (validated against the PrimitiveSimulator)
   -> redc.physical-primitive.v1 JSON       (+ redc.physical-primitive.pnr.v1 replay trace)
 ```
+
+A design only succeeds when routing, legalization, independent verification,
+**timing closure** (zero clock skew, setup and hold) and the **redstone
+simulation check** all pass: one logical cycle is one physical clock period.
+See [minecraft-timing.md](minecraft-timing.md) and
+[minecraft-simulator.md](minecraft-simulator.md).
 
 No handcrafted `uint8_adder`, `uint32_comparator` or `uint16_multiplier` cell is
 needed: an adder is AND/OR/XOR gates, a divider is comparators, subtractors
@@ -42,7 +51,10 @@ uv run redc dump-primitive-netlist examples/uint8_alu.redc                      
 `--no-viewer`, `--spacing`, `--routing-margin`, `--max-route-iterations` and
 `--max-attempts` work with both backends. `--channel-width` (free blocks
 between placement columns), `--max-height` (highest block y routes may use) and
-`--interface default|pads` are primitive-only; `--grid-height` and
+`--interface default|pads` are primitive-only, as are the timing options
+`--clock-period RT` (default: automatic; a given period is checked, never
+raised), `--clock-margin RT` (added to the automatic period, default 1) and
+`--max-clock-skew RT` (default 0); `--grid-height` and
 `--layer-gap` are coarse-only. Passing an option the selected backend does not
 understand is an error, as is an unknown `--backend` (never a silent
 fallback). The trace is written even when P&R fails; the command then exits 1
@@ -90,6 +102,10 @@ design = result.to_design_dict()                     # the final physical truth
 | `pnr/search.py`, `pnr/routing.py` | routing | redstone-aware A*, directed trees, PathFinder negotiation |
 | `pnr/legalize.py` | legalization | signal strength, repeater insertion |
 | `pnr/verify.py` | verification | independent re-check of every geometric/electrical rule |
+| `materialize.py` | physical | the legalized design as a backend-neutral `MinecraftPhysicalDesign` |
+| `pnr/clock.py` | timing | clock-tree arrivals and tree-aware physical balancing |
+| `pnr/timing.py` | timing | balancing -> materialize -> STA / closure -> redstone simulation validation |
+| `technology/structures.py` | tech mapping | reference block-level cells (NOT, OR, pads, ...), characterized by simulation |
 | `pnr/design.py`, `pnr/trace.py`, `pnr/records.py` | output | attempts, metrics, final JSON, replay trace |
 | `backend.py` | CLI | the pipeline behind `--backend physical-primitive` |
 
@@ -229,17 +245,44 @@ artifacts alone (placed voxels and realized routes), including an independent
 signal-strength recomputation, so a design that passes is legal under the
 model regardless of the router's internal state.
 
-Not modelled (documented limitations): quasi-connectivity, comparators, block
-update order and tick-accurate timing races, and the real behaviour of the
-placeholder gate internals.
+The legality rules above are geometric. The *behaviour* of the routed blocks
+is then checked by the redstone simulator, which derives connectivity from the
+block layout alone. Not modelled (documented limitations): quasi-connectivity,
+comparators, Java's tick priorities and block-update order inside one game
+tick, and the real behaviour of the placeholder gate internals. Placeholder
+cells are simulated as ABSTRACT components with declared truth tables and
+timing, and every report says `abstract-components`.
 
 ## Timing
 
 Three notions stay separate: **state** (only register bits hold it),
 **logical depth** (gates on the longest combinational path) and **physical
-delay** (cell latencies plus repeater ticks along realized routes). Metrics
-report all three (`metrics.timing`); the delay is an estimate over placeholder
-latencies.
+delay**. Physical delay is the static timing analysis of the *materialized*
+world: repeater settings, torch delays and declared cell arcs, from the timing
+model the simulator also uses. It decides the clock period. It never decides
+which logical cycle something happens on.
+
+After verification, every attempt:
+
+1. measures the clock arrival at every register clock pin from the routed clock
+   tree;
+2. **balances** it to zero skew by raising repeater delays and turning eligible
+   dust into repeaters, so every added delay is a real block state;
+3. re-verifies the changed route;
+4. materializes the world, then runs STA and closure: the automatic period is
+   the smallest safe one plus `clock_margin_rt`, and every setup and hold slack
+   must be ≥ 0;
+5. drives the world in the redstone simulator at that clock and compares outputs,
+   every register bit and the `done` cycle with the `PrimitiveSimulator`.
+
+Every register clock sink gets a reserved straight **clock tap** in front of
+its pin (`clock_tap_length`), so balancing always has exclusive repeater sites.
+Only `timing/clock_balance` triggers another, roomier attempt. `timing/setup`,
+`timing/hold`, `timing/clock_skew` and the `simulation/*` failures are
+deterministic and end the run. `metrics.timing` summarizes the result; the full
+report is the design's `timing` block. Placeholder cells declare their timing
+(`placeholder_estimate: true`). The reference structures' gate timing is
+measured by simulation.
 
 ## Outputs
 
@@ -250,8 +293,11 @@ latencies.
   keep-out, pins with their nets), nets (logical aliases, driver, sinks, the
   route tree, and the realized route: typed dust/repeater elements with
   direction and strength, supports, clearances, per-sink strength and delay),
-  bounds and metrics. It is the physical truth a future NBT/schematic exporter
-  consumes — never reconstructed from the trace.
+  bounds, metrics, and the physical sign-off: `clock_tree` (balancing),
+  `timing` (clock period, skew, setup/hold slacks and critical paths), `simulation`
+  (mode, model, Minecraft version, validated) and `world` — the materialized
+  `redc.minecraft-design.v1` block world. It is the physical truth a future
+  NBT/schematic exporter consumes — never reconstructed from the trace.
 * **Replay trace** `redc.physical-primitive.pnr.v1`: see
   [physical-primitive-trace.md](physical-primitive-trace.md).
 
@@ -260,4 +306,6 @@ latencies.
 Boolean simplification, structural hashing, CSE, carry-lookahead, Wallace /
 Booth multipliers, better dividers, specialized Minecraft cells and gate fusion
 (through `realizes`), bus-aware placement hints, timing-driven placement and
-routing, dedicated crossover cells, real in-game cell structures and NBT export.
+routing, dedicated crossover cells, block-level AND / XOR / register cells
+(today only NOT, OR, pads, levers, lamps and constants have reference
+structures), in-game verification and NBT export.

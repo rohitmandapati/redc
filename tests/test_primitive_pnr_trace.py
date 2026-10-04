@@ -114,8 +114,8 @@ RECORDS = {
         {"library", "cells", "instances", "nets", "groups", "ports", "buses", "ir_nodes", "summary"}, set()
     ),
     "cell": (
-        {"name", "kind", "placeholder", "structure", "latency", "stateful", "description", "orientations",
-         "peripheral", "voxels", "keepout", "pins"},
+        {"name", "kind", "placeholder", "structure", "latency", "timing", "materialized", "structure_blocks",
+         "stateful", "description", "orientations", "peripheral", "voxels", "keepout", "pins"},
         set(),
     ),
     "pin": ({"name", "direction", "position", "facing", "strength"}, set()),
@@ -131,16 +131,20 @@ RECORDS = {
     "ir_node": ({"id", "op", "type", "args"}, {"name", "value", "init"}),
     "final": (
         {"success", "attempt", "attempts", "geometry", "failure", "placement", "routes", "realized", "conflicts",
-         "violations", "design_bounds", "search_bounds", "metrics"},
+         "violations", "clock_tree", "timing", "simulation", "simulation_playback", "design_bounds", "search_bounds",
+         "metrics"},
         set(),
     ),
-    "failure": ({"stage", "reason", "message", "attempt", "attempts", "net", "iteration", "details"}, set()),
-    "geometry": ({"attempt", "component_spacing", "channel_width", "routing_margin", "max_y"}, set()),
+    "failure": (
+        {"code", "retryable", "stage", "reason", "message", "attempt", "attempts", "net", "iteration", "details"},
+        set(),
+    ),
+    "geometry": ({"attempt", "component_spacing", "channel_width", "routing_margin", "max_y", "clock_tap"}, set()),
     "placement": ({"instance", "origin", "orientation", "bounds"}, set()),
     "route": ROUTE,
     "branch": ({"sink", "start", "goal", "path"}, set()),
     "realized": REALIZED,
-    "element": ({"coord", "kind", "parent", "strength", "delay"}, {"facing", "blockstate_facing"}),
+    "element": ({"coord", "kind", "parent", "strength", "delay"}, {"facing", "blockstate_facing", "repeater_delay"}),
     "sink": ({"instance", "pin", "coord", "strength", "required", "repeaters", "delay_ticks", "distance"}, set()),
 }  # fmt: skip
 
@@ -193,6 +197,15 @@ EVENT_FIELDS = {
     "route_realized": REALIZED[0],
     "legalization_complete": {"round", "realized", "failures", "repeaters"},
     "illegal_transition": {"kind", "message", "cells", "nets"},
+    "clock_tree_analyzed": {"net", "sinks", "skew"},
+    "clock_balanced": {"net", "success", "message", "sinks", "skew_before", "skew_after", "arrival_max", "changes",
+                       "repeaters_added", "repeaters_raised", "delay_added_rt", "realized"},
+    "clock_balance_failed": {"net", "message"},
+    "timing_analyzed": {"sequential", "passed"},
+    "timing_closed": {"sequential", "passed"},
+    "timing_failed": {"failures"},
+    "simulation_validated": {"mode", "validated", "sim_events", "simulated_ticks_gt", "failures"},
+    "simulation_failed": {"mode", "validated", "failures"},
     "design_finalized": {"attempt", "nets", "dust", "repeaters", "supports", "bounds"},
     "pnr_attempt_end": {"attempt", "status", "failure", "metrics"},
     "pnr_end": {"success", "attempts"},
@@ -353,6 +366,8 @@ def replay(events: list[dict[str, Any]]) -> dict[str, Any]:
             state["realized"].pop(event["net"], None)
         elif kind == "route_realized":
             state["realized"][event["net"]] = payload(event, "round")
+        elif kind == "clock_balanced":
+            state["realized"][event["net"]] = event["realized"]
         elif kind == "congestion_snapshot":
             state["congestion"] = event["conflicts"]
         elif kind == "keyframe":
@@ -616,7 +631,8 @@ def test_event_payloads_carry_the_documented_fields() -> None:
     # Events that only a forced failure produces are covered by the tests below.
     assert set(table) - checked <= {"component_place_rejected", "legalization_failed", "illegal_transition",
                                     "branch_path_rejected", "physical_conflict", "net_route_restarted",
-                                    "routing_aborted"}  # fmt: skip
+                                    "routing_aborted", "clock_balance_failed", "timing_failed",
+                                    "simulation_failed"}  # fmt: skip
 
 
 #: ``(event type, key)`` pairs where a coordinate-list key holds a COUNT instead.
@@ -1189,6 +1205,7 @@ def test_realized_routes_are_electrically_consistent_records(source: str) -> Non
     trace, final = run.trace, run.trace["final"]
     pins = pin_index(trace)
     nets = {n["id"]: n for n in trace["design"]["nets"]}
+    clock_nets = {n["id"] for n in trace["design"]["nets"] if n["role"] == "clock"}
     routes = {r["net"]: r for r in final["routes"]}
     assert sorted(routes) == sorted(nets) == sorted(r["net"] for r in final["realized"])
     for realized in final["realized"]:
@@ -1216,7 +1233,9 @@ def test_realized_routes_are_electrically_consistent_records(source: str) -> Non
             assert element["strength"] == expected, (realized["net"], cell)
             ticks = 0 if up is None else elements[up]["delay"]
             if up is not None and elements[up]["kind"] == "repeater":
-                ticks += REPEATER_DELAY_TICKS
+                # Legalization uses the default delay; only the clock may be balanced higher.
+                assert elements[up]["repeater_delay"] == REPEATER_DELAY_TICKS or realized["net"] in clock_nets
+                ticks += elements[up]["repeater_delay"]
             assert element["delay"] == ticks
             if realized["powered"]:
                 assert element["strength"] >= 1
@@ -1311,7 +1330,8 @@ def test_failed_pnr_still_has_a_complete_trace() -> None:
     final = trace["final"]
     assert final["success"] is False and result.success is False
     failure = final["failure"]
-    assert set(failure) == {"stage", "reason", "message", "attempt", "attempts", "net", "iteration", "details"}
+    assert set(failure) == {"code", "retryable", "stage", "reason", "message", "attempt", "attempts", "net",
+                            "iteration", "details"}
     assert (failure["stage"], failure["reason"], failure["attempt"], failure["attempts"]) == (
         "routing", "unroutable", 1, 2
     )  # fmt: skip

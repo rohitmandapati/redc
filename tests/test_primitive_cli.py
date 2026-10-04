@@ -301,9 +301,11 @@ def test_invalid_primitive_settings_fail_before_any_trace(
         (
             "physical-primitive",
             ["--spacing", "2", "--routing-margin", "4", "--max-route-iterations", "5", "--max-attempts", "2",
-             "--channel-width", "7", "--max-height", "11", "--trace-level", "detailed"],
+             "--channel-width", "7", "--max-height", "11", "--trace-level", "detailed", "--clock-period", "40",
+             "--clock-margin", "2", "--max-clock-skew", "1"],
             {"component_spacing": 2, "routing_margin": 4, "max_routing_iterations": 5, "max_pnr_attempts": 2,
-             "channel_width": 7, "max_y": 11, "trace_level": "detailed"},
+             "channel_width": 7, "max_y": 11, "trace_level": "detailed", "clock_period_rt": 40, "clock_margin_rt": 2,
+             "max_clock_skew_rt": 1},
         ),
         (
             "physical",
@@ -346,9 +348,12 @@ def test_unknown_backend_lists_the_choices(cli: Invoke, tmp_path: Path, command:
         ("physical", ["--max-height", "5"], "physical-primitive"),
         ("physical", ["--channel-width", "3"], "physical-primitive"),
         ("physical", ["--interface", "pads"], "physical-primitive"),
+        ("physical", ["--clock-period", "10"], "physical-primitive"),
+        ("physical", ["--max-clock-skew", "1"], "physical-primitive"),
         (None, ["--max-height", "5"], "physical-primitive"),
     ],
-    ids=["grid-height", "layer-gap", "max-height", "channel-width", "interface", "default-backend"],
+    ids=["grid-height", "layer-gap", "max-height", "channel-width", "interface", "clock-period", "max-clock-skew",
+         "default-backend"],
 )
 def test_options_of_the_other_backend_are_rejected(
     cli: Invoke, tmp_path: Path, backend: str | None, option: list[str], owner: str
@@ -523,3 +528,31 @@ def test_default_pnr_still_writes_the_coarse_viewer(cli: Invoke, tmp_path: Path)
     page = (tmp_path / "build" / "uint8_add.pnr.html").read_text(encoding="utf-8")
     assert embedded_trace(page)["schema"] == "redc.pnr.trace.v1"
     assert "<title>RedC P&amp;R - uint8_add.redc</title>" in page
+
+
+# -- timing closure ---------------------------------------------------------------------
+
+COUNTER = "uint2 main(uint2 n) { uint2 x = 0; for (uint2 i = 0; i < n; i++) { x = x + 1; } return x; }"
+
+
+def test_sequential_pnr_reports_timing_closure_and_writes_the_reports(cli: Invoke, tmp_path: Path) -> None:
+    source = program(tmp_path, "count", COUNTER)
+    result = cli("pnr", source, "--backend", "physical-primitive", "--interface", "pads", "--no-viewer")
+    assert result.exit_code == 0, result.output
+    assert "Timing: clock" in result.output and "(auto), skew 0 rt" in result.output
+    assert "redstone simulation (abstract-components) validated" in result.output
+    design = json.loads((tmp_path / "build" / "count.primitive.physical.json").read_text(encoding="utf-8"))
+    assert design["timing"]["closure"]["passed"] and design["timing"]["clock"]["skew"]["gt"] == 0
+    assert design["simulation"]["validated"] and design["world"]["schema"] == "redc.minecraft-design.v1"
+
+
+def test_a_too_short_clock_period_fails_with_a_trace_and_no_design(cli: Invoke, tmp_path: Path) -> None:
+    source = program(tmp_path, "count", COUNTER)
+    result = cli("pnr", source, "--backend", "physical-primitive", "--interface", "pads", "--clock-period", "4")
+    assert result.exit_code == 1
+    assert "the requested clock period of 4 rt is shorter than" in result.output
+    assert "after 1 attempt(s)" in result.output  # deterministic: never retried
+    trace = load_trace(tmp_path / "build" / "count.primitive.pnr.json")
+    assert trace["final"]["failure"]["code"] == "timing/setup"
+    assert trace["final"]["timing"]["clock"]["period"]["rt"] == 4  # the user's period, not raised
+    assert not (tmp_path / "build" / "count.primitive.physical.json").exists()

@@ -710,6 +710,8 @@ def reference_signatures(trace: dict, max_cells: int = MAX_SEARCH_CELLS) -> list
         elif kind == "route_realized":  # a realized net's legalization failure is superseded
             realized[e["net"]] = e
             failures = [f for f in failures if f != ["legalization", e["net"]]]
+        elif kind == "clock_balanced":  # the balanced clock route replaces the legalized one
+            realized[e["net"]] = e["realized"]
         out.append(signature())
     return out
 

@@ -93,6 +93,14 @@ Every IR width works here (`uint3` included). Circuits get very large; that is
 intentional. See [docs/physical-primitive.md](docs/physical-primitive.md) and
 [docs/physical-primitive-trace.md](docs/physical-primitive-trace.md).
 
+Every routed design is materialized as backend-neutral Minecraft blocks
+(`redc.minecraft`), simulated by an event-driven redstone simulator and closed
+for timing. The clock tree is physically balanced, the clock period is chosen
+automatically (`--clock-period` checks a given one), and setup and hold are
+checked. One logical cycle is one physical clock period, verified by simulating
+the design at that clock. See [docs/minecraft-simulator.md](docs/minecraft-simulator.md)
+and [docs/minecraft-timing.md](docs/minecraft-timing.md).
+
 See `examples/` for sample programs.
 
 ## Roadmap

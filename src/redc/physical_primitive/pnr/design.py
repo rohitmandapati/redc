@@ -4,7 +4,10 @@
         --place_design-->        PlacedPrimitiveDesign
         --NegotiatedRedstoneRouter--> RoutedPrimitiveDesign      (geometric routes)
         --legalize_route-->      LegalizedPrimitiveDesign        (dust / repeaters)
-        --verify_design-->       final ``redc.physical-primitive.v1`` JSON
+        --verify_design-->       independent geometric / electrical check
+        --run_timing_stage-->    clock balancing, materialized MinecraftPhysicalDesign,
+                                 static timing closure, redstone simulation validation
+                                 -> final ``redc.physical-primitive.v1`` JSON
 
 :func:`place_and_route_primitive` runs attempts; each starts from a fresh grid
 with deterministically wider spacing, taller routing room and a larger search
@@ -15,7 +18,10 @@ a failed run still returns a result whose trace can be written.
 
 Three timing notions are kept apart: *state* (only REGISTER_BIT cells hold
 it), *logical depth* (gates on the longest combinational path) and *physical
-delay* (cell latencies plus repeater ticks along the realized routes).
+delay* -- the static timing analysis of the materialized design
+(:mod:`redc.minecraft.sta`), which decides the physical clock period.  A
+design only succeeds once routing, legalization, verification, timing closure
+and the simulation check all pass; only a clock-balance failure is retried.
 """
 
 from __future__ import annotations
@@ -26,11 +32,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from ...minecraft.timing import TIMING_MODEL
 from ...parser import CompileError
 from ...tracing import TraceLevel
 from ..geometry import Bounds, coord_list
 from ..grid import BlockGrid
-from ..netlist import GATE_KINDS, BitTerminal, PrimitiveKind
+from ..materialize import materialize_design
+from ..netlist import GATE_KINDS, BitTerminal
 from ..physical import PrimitivePhysicalNetlist
 from ..redstone import (
     CLEARANCE_MATERIAL,
@@ -50,6 +58,7 @@ from .routing import (
     RoutingOutcome,
     route_requests,
 )
+from .timing import TimingStage, run_timing_stage
 from .trace import BACKEND, COORDINATE_SYSTEM, PrimitiveTraceRecorder
 from .verify import Violation, verify_design
 
@@ -82,7 +91,7 @@ class LegalizedPrimitiveDesign:
 class PrimitivePnRFailure:
     """Why primitive P&R failed, as of the last attempt."""
 
-    stage: str  # placement | routing | legalization | verification
+    stage: str  # placement | routing | legalization | verification | timing | simulation
     reason: str
     message: str
     attempt: int
@@ -90,9 +99,19 @@ class PrimitivePnRFailure:
     net: int | None = None
     iteration: int | None = None
     details: tuple[dict[str, Any], ...] = ()
+    #: Whether another (roomier) attempt may help.  Timing and simulation
+    #: failures other than clock balancing are deterministic: never retried.
+    retryable: bool = True
+
+    @property
+    def code(self) -> str:
+        """``stage/reason``, e.g. ``timing/setup`` or ``simulation/logic_mismatch``."""
+        return f"{self.stage}/{self.reason}"
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "code": self.code,
+            "retryable": self.retryable,
             "stage": self.stage,
             "reason": self.reason,
             "message": self.message,
@@ -129,6 +148,7 @@ class PrimitivePnRResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     failure: PrimitivePnRFailure | None = None
     violations: list[Violation] = field(default_factory=list)
+    timing: TimingStage | None = None
 
     @property
     def grid(self) -> BlockGrid | None:
@@ -181,6 +201,13 @@ class PrimitivePnRResult:
             route = self.legalized.realized[record["id"]]
             nets.append({**record, "route": route.tree.to_dict(), "realized": route.to_dict()})
         bounds = self.design_bounds
+        stage = self.timing
+        assert stage is not None and stage.world is not None and stage.closure is not None
+        # The timing and simulation reports must describe THIS world: any
+        # route change after they were computed would make them stale.
+        current = materialize_design(mapped, self.legalized.realized, source=self.trace.source)
+        if current.fingerprint() != stage.closure.analysis.fingerprint:
+            raise CompileError("stale timing: the design changed after timing analysis")
         return {
             "schema": PHYSICAL_SCHEMA,
             "backend": BACKEND,
@@ -210,6 +237,10 @@ class PrimitivePnRResult:
             "instances": instances,
             "nets": nets,
             "bounds": bounds.to_dict() if bounds else None,
+            "clock_tree": None if stage.balance is None else stage.balance.to_dict(),
+            "timing": stage.closure.report,
+            "simulation": stage.simulation,
+            "world": stage.world.to_dict(),
             "metrics": self.metrics,
         }
 
@@ -237,7 +268,7 @@ def place_and_route_primitive(
     result: PrimitivePnRResult | None = None
     for attempt in range(config.max_pnr_attempts):
         result = _attempt(mapped, config, recorder, attempt)
-        if result.success:
+        if result.success or (result.failure is not None and not result.failure.retryable):
             break
     assert result is not None
     recorder.emit("pnr", "pnr_end", success=result.success, attempts=result.attempts)
@@ -266,7 +297,7 @@ def _attempt(
     except PlacementError as error:
         trace.emit("placement", "placement_failed", attempt=attempt, reason=str(error))
         return fail("placement", "placement", str(error))
-    requests = {r.net: r for r in route_requests(mapped, grid)}
+    requests = {r.net: r for r in route_requests(mapped, grid, clock_tap_length=geometry.clock_tap)}
     extent = grid.placement_bounds
     assert extent is not None
     margin = geometry.routing_margin
@@ -322,6 +353,20 @@ def _attempt(
             trace.emit("legalization", "illegal_transition", **violation.to_dict())
         return fail("verification", violations[0].kind, violations[0].message,
                     details=tuple(v.to_dict() for v in violations[:50]))  # fmt: skip
+    stage = run_timing_stage(mapped, requests, result.legalized.realized, config, trace, max_y=geometry.max_y)
+    result.timing = stage
+    # The timing stage may have balanced the clock route: its routes are now the design.
+    result.legalized = LegalizedPrimitiveDesign(result.routed, stage.realized, result.legalized.rounds)
+    if not stage.success:
+        assert stage.failure is not None
+        code, message = stage.failure
+        stage_name, reason = code.split("/", 1)
+        details = tuple(v.to_dict() for v in stage.violations[:50])
+        if stage.closure is not None:
+            details += tuple(stage.closure.report["closure"]["failures"][:20])
+        if stage.simulation is not None:
+            details += tuple(stage.simulation.get("failures", [])[:20])
+        return fail(stage_name, reason, message, details=details, retryable=stage.retryable)
     result.success = True
     result.metrics = compute_metrics(result)
     bounds = result.design_bounds
@@ -459,47 +504,33 @@ def logic_depth(mapped: PrimitivePhysicalNetlist) -> int:
     return max(depth.values(), default=0)
 
 
-def physical_delay(mapped: PrimitivePhysicalNetlist, realized: Mapping[int, RealizedRoute]) -> dict[str, Any]:
-    """Estimated settle time in redstone ticks: cell latency plus repeater
-    delay along each route, over the longest combinational path."""
-    logical = mapped.logical
-    route_delay: dict[tuple[int, str], int] = {}
-    for route in realized.values():
-        for report in route.sinks:
-            route_delay[(report.sink.instance, report.sink.pin)] = report.delay_ticks
-    unknown = sorted({i.cell.name for i in mapped.instances if i.cell.latency is None})
-    arrival: dict[int, int] = {}
-    deps: dict[int, list[tuple[int, int]]] = {}
-    users: dict[int, list[int]] = {}
-    for net in logical.nets:
-        for sink in net.sinks:
-            hop = route_delay.get((sink.instance, sink.pin), 0)
-            deps.setdefault(sink.instance, []).append((net.driver.instance, hop))
-            users.setdefault(net.driver.instance, []).append(sink.instance)
-    gates = {i.id for i in logical.instances if i.kind in GATE_KINDS}
-    pending = {g: sum(1 for d, _ in deps.get(g, ()) if d in gates) for g in gates}
-    ready = [g for g in gates if pending[g] == 0]
-    heapq.heapify(ready)
-
-    def start(inst_id: int) -> int:
-        cell = mapped.instances[inst_id].cell
-        return arrival.get(inst_id, cell.latency or 0) if inst_id in gates else (cell.latency or 0)
-
-    while ready:
-        gate = heapq.heappop(ready)
-        latency = mapped.instances[gate].cell.latency or 0
-        arrival[gate] = latency + max((start(d) + hop for d, hop in deps.get(gate, ())), default=0)
-        for user in users.get(gate, ()):
-            if user in pending:
-                pending[user] -= 1
-                if pending[user] == 0:
-                    heapq.heappush(ready, user)
-    worst = 0
-    for inst in logical.instances:
-        if inst.kind in (PrimitiveKind.OUTPUT_BIT, PrimitiveKind.REGISTER_BIT, PrimitiveKind.PERIPHERAL):
-            for d, hop in deps.get(inst.id, ()):
-                worst = max(worst, start(d) + hop)
-    return {"critical_path_ticks": worst, "unknown_latency_cells": unknown, "placeholder_estimate": True}
+def timing_metrics(result: PrimitivePnRResult) -> dict[str, Any]:
+    """The timing summary in the metrics (the full report is ``timing``)."""
+    mapped = result.mapped
+    placeholder = any(
+        i.cell.placeholder and (i.cell.timing is None or i.cell.timing.source == "declared") for i in mapped.instances
+    )
+    record: dict[str, Any] = {"model": TIMING_MODEL, "placeholder_estimate": placeholder, "closure": None}
+    stage = result.timing
+    if stage is None or stage.closure is None:
+        return record
+    report = stage.closure.report
+    record["closure"] = report["closure"]["passed"]
+    record["simulation_validated"] = None if stage.simulation is None else stage.simulation.get("validated")
+    record["simulation_mode"] = None if stage.world is None else stage.world.mode
+    if report["sequential"]:
+        clock = report["clock"]
+        record.update(
+            clock_period_rt=clock["period"]["rt"],
+            clock_mode=clock["mode"],
+            clock_skew_rt=clock["skew"]["rt"],
+            clock_arrival_max_rt=clock["arrival_max"]["rt"],
+            worst_setup_slack_gt=None if report["setup"]["worst_slack"] is None else report["setup"]["worst_slack"]["gt"],
+            worst_hold_slack_gt=None if report["hold"]["worst_slack"] is None else report["hold"]["worst_slack"]["gt"],
+        )
+    else:
+        record["combinational_settle_gt"] = report["combinational"]["settle"]["gt"]
+    return record
 
 
 def compute_metrics(result: PrimitivePnRResult) -> dict[str, Any]:
@@ -575,7 +606,7 @@ def compute_metrics(result: PrimitivePnRResult) -> dict[str, Any]:
         "timing": {
             "state_elements": summary["register_bits"],
             "logic_depth": logic_depth(mapped),
-            **physical_delay(mapped, realized),
+            **timing_metrics(result),
         },
         "pnr": {"attempts": result.attempts, "attempt": result.geometry.attempt},
         "final": {
@@ -615,6 +646,10 @@ def _final_state(result: PrimitivePnRResult) -> dict[str, Any]:
         "realized": [result.realized[n].to_dict() for n in sorted(result.realized)],
         "conflicts": conflicts,
         "violations": [v.to_dict() for v in result.violations[:200]],
+        "clock_tree": None if result.timing is None or result.timing.balance is None else result.timing.balance.to_dict(),
+        "timing": None if result.timing is None or result.timing.closure is None else result.timing.closure.report,
+        "simulation": None if result.timing is None else result.timing.simulation,
+        "simulation_playback": None if result.timing is None else result.timing.playback,
         "design_bounds": bounds.to_dict() if bounds else None,
         "search_bounds": None if result.routed is None else result.routed.search_bounds.to_dict(),
         "metrics": result.metrics,
@@ -631,6 +666,6 @@ __all__ = [
     "compute_metrics",
     "legalize_all",
     "logic_depth",
-    "physical_delay",
     "place_and_route_primitive",
+    "timing_metrics",
 ]

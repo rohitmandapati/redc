@@ -254,14 +254,16 @@ class BlockGrid:
         _inc(self.clearance, cell, net)
         self.used[cell] = self.used.get(cell, 0) + 1
 
-    def release(self, net: int, *, keep: Iterable[Coord] = ()) -> None:
-        """Rip up every claim of ``net`` except signal claims on ``keep``
-        (its pin endpoints, which stay reserved)."""
+    def release(self, net: int, *, keep: Iterable[Coord] = (), keep_supports: Iterable[Coord] = ()) -> None:
+        """Rip up every claim of ``net`` except signal claims on ``keep`` (its
+        pin endpoints and clock-tap blocks, which stay reserved) and support
+        claims on ``keep_supports`` (the supports of its clock taps)."""
         claims = self.claims.pop(net, None)
         if claims is None:
             return
         kept = NetClaims()
         keep_set = set(keep)
+        keep_support_set = set(keep_supports)
         for cell, count in claims.signals.items():
             if cell in keep_set:
                 kept.signals[cell] = 1
@@ -275,12 +277,18 @@ class BlockGrid:
             for dx, dy, dz in SIGNAL_NEIGHBORHOOD:
                 _dec(self.adjacent, (x + dx, y + dy, z + dz), net)
         for cell, count in claims.supports.items():
+            if cell in keep_support_set:
+                kept.supports[cell] = 1
+                if count > 1:
+                    _dec(self.support, cell, net, count - 1)
+                    self._unuse(cell, count - 1)
+                continue
             _dec(self.support, cell, net, count)
             self._unuse(cell, count)
         for cell, count in claims.clearances.items():
             _dec(self.clearance, cell, net, count)
             self._unuse(cell, count)
-        if kept.signals:
+        if kept.signals or kept.supports:
             self.claims[net] = kept
 
     def _unuse(self, cell: Coord, count: int) -> None:

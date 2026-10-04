@@ -27,6 +27,7 @@ are never ripped up, so every route can see (and avoid crowding) every pin.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property, partial
@@ -37,7 +38,7 @@ from ...tracing import TraceLevel
 from ..geometry import Bounds, Coord, coord_list, manhattan
 from ..grid import BlockGrid, Conflict, PinSite
 from ..physical import PrimitivePhysicalNetlist
-from ..redstone import clearance_of, support_of
+from ..redstone import clearance_of, neighborhood, support_of
 from .config import PrimitivePnRConfig
 from .search import NetState, search_branch, validate_branch
 from .trace import PrimitiveTraceRecorder
@@ -45,16 +46,71 @@ from .trace import PrimitiveTraceRecorder
 
 @dataclass(frozen=True)
 class RouteRequest:
-    """What one net must connect: its driver pin block to every sink pin block."""
+    """What one net must connect: its driver pin block to every sink pin block.
+
+    ``taps`` (clock nets): ``(sink pin block, tap blocks)`` -- a straight, level
+    run of blocks in front of that sink pin, ordered outward from the pin.  The
+    branch is routed to the OUTERMOST tap block (the tap entry) and then runs
+    straight down the tap into the pin, so every clock sink owns an exclusive
+    straight segment: room for the repeaters clock balancing adds.  Tap blocks
+    and their supports are reserved for the net like its pins."""
 
     net: int
     role: str
     driver: PinSite
     sinks: tuple[PinSite, ...]
+    taps: tuple[tuple[Coord, tuple[Coord, ...]], ...] = ()
 
     @property
     def fanout(self) -> int:
         return len(self.sinks)
+
+    def tap(self, sink: PinSite) -> tuple[Coord, ...]:
+        for cell, blocks in self.taps:
+            if cell == sink.cell:
+                return blocks
+        return ()
+
+    @cached_property
+    def routing_sinks(self) -> tuple[PinSite, ...]:
+        """The goals the router searches for: a tapped sink is entered at its tap entry."""
+        goals = []
+        for sink in self.sinks:
+            tap = self.tap(sink)
+            goals.append(sink if not tap else dataclasses.replace(sink, cell=tap[-1]))
+        return tuple(goals)
+
+    def goal_link(self, goal: PinSite) -> Coord | None:
+        """For a tap entry goal: the next block down its tap (else ``None``)."""
+        for sink, routed in zip(self.sinks, self.routing_sinks):
+            if routed is goal:
+                tap = self.tap(sink)
+                return (tap[-2] if len(tap) >= 2 else sink.cell) if tap else None
+        return None
+
+    @cached_property
+    def tap_blocks(self) -> frozenset[Coord]:
+        return frozenset(c for _cell, blocks in self.taps for c in blocks)
+
+    @cached_property
+    def tap_supports(self) -> frozenset[Coord]:
+        return frozenset(support_of(c) for c in self.tap_blocks)
+
+    @cached_property
+    def reserved_cells(self) -> frozenset[Coord]:
+        """Signal blocks the net owns from the start: its pins and tap blocks."""
+        return self.pins | self.tap_blocks
+
+    def real_branch(self, branch: RouteBranch) -> RouteBranch:
+        """A branch routed to a tap entry, extended down the tap into the real pin."""
+        for sink, goal in zip(self.sinks, self.routing_sinks):
+            if goal is branch.sink:
+                tap = self.tap(sink)
+                if not tap:
+                    return branch
+                tail = tuple(reversed(tap[:-1])) + (sink.cell,)
+                return RouteBranch(sink, branch.path + tail)
+        return branch
 
     @property
     def span(self) -> int:
@@ -279,14 +335,45 @@ def approach_corridor(site: PinSite) -> tuple[Coord, Coord]:
     return ((x + fx, y, z + fz), (x + fx, y + 1, z + fz))
 
 
-def route_requests(mapped: PrimitivePhysicalNetlist, grid: BlockGrid) -> list[RouteRequest]:
-    """One :class:`RouteRequest` per net (id order) from the placed pin sites."""
+def clock_tap(grid: BlockGrid, site: PinSite, length: int) -> tuple[Coord, ...]:
+    """Up to ``length`` straight level blocks in front of ``site`` that can be
+    reserved for its net: no component, keep-out or pin in a block or its
+    support, and no OTHER pin or pin approach in its signal neighbourhood
+    (that would be an unresolvable short).  Stops at the first block that fails."""
+    others = {c for c, s in grid.pins.items() if s.net != site.net}
+    for other in grid.pins.values():
+        if other.net != site.net:
+            others.update(approach_corridor(other))
+    blocks: list[Coord] = []
+    fx, _, fz = site.facing.vector
+    x, y, z = site.cell
+    for step in range(1, length + 1):
+        cell = (x + fx * step, y, z + fz * step)
+        sup = support_of(cell)
+        if grid.static.get(cell) or grid.static.get(sup) or not grid.in_height(cell):
+            break
+        approach = grid.approaches.get(cell)
+        if approach is not None and approach != site:
+            break
+        if cell in others or sup in others or any(n in others for n in neighborhood(cell)):
+            break
+        blocks.append(cell)
+    return tuple(blocks)
+
+
+def route_requests(mapped: PrimitivePhysicalNetlist, grid: BlockGrid, *, clock_tap_length: int = 0) -> list[RouteRequest]:
+    """One :class:`RouteRequest` per net (id order) from the placed pin sites;
+    clock sinks get a :func:`clock_tap` of up to ``clock_tap_length`` blocks."""
     sites = {(site.instance, site.pin): site for site in grid.pins.values()}
     requests = []
     for net in mapped.nets:
         driver = sites[(net.driver.instance, net.driver.pin)]
         sinks = tuple(sites[(s.instance, s.pin)] for s in net.sinks)
-        requests.append(RouteRequest(net.id, net.role, driver, sinks))
+        taps: tuple[tuple[Coord, tuple[Coord, ...]], ...] = ()
+        if net.role == "clock" and clock_tap_length > 0:
+            found = [(s.cell, clock_tap(grid, s, clock_tap_length)) for s in sinks]
+            taps = tuple((cell, blocks) for cell, blocks in found if blocks)
+        requests.append(RouteRequest(net.id, net.role, driver, sinks, taps))
     return requests
 
 
@@ -327,14 +414,17 @@ class NegotiatedRedstoneRouter:
             else 0
         )
         for request in self.order:
-            for site in (request.driver, *request.sinks):
-                grid.claim_signal(request.net, site.cell)
+            for cell in sorted(request.reserved_cells):
+                grid.claim_signal(request.net, cell)
+            for cell in sorted(request.tap_supports):
+                grid.claim_support(request.net, cell)
 
     # -- one net ---------------------------------------------------------------
 
     def _rip_up(self, net: int, reason: str) -> None:
         old = self.routes.pop(net, None)
-        self.grid.release(net, keep=self.requests[net].pins)
+        request = self.requests[net]
+        self.grid.release(net, keep=request.reserved_cells, keep_supports=request.tap_supports)
         self.rip_ups += 1
         if self.trace and old is not None:
             self.trace.emit(
@@ -361,7 +451,7 @@ class NegotiatedRedstoneRouter:
                 fanout=request.fanout,
             )  # fmt: skip
         root = request.driver.cell
-        order = sorted(request.sinks, key=lambda s: (manhattan(root, s.cell), s.instance, s.pin))
+        order = sorted(request.routing_sinks, key=lambda s: (manhattan(root, s.cell), s.instance, s.pin))
         restarts = 0
         while True:
             outcome = self._grow_tree(request, order, detailed)
@@ -397,9 +487,10 @@ class NegotiatedRedstoneRouter:
         and return the failing sink with the failure."""
         trace, net, grid, iteration = self.trace, request.net, self.grid, self.iteration
         root = request.driver.cell
-        state = NetState(net, request.driver, request.pins, {root}, set(), {})
+        state = NetState(net, request.driver, request.reserved_cells, {root}, set(), {})
         tree_order: list[Coord] = [root]
         branches: list[RouteBranch] = []
+        taps = request.tap_blocks
         for index, sink in enumerate(order):
             if detailed:
                 assert trace is not None
@@ -408,9 +499,11 @@ class NegotiatedRedstoneRouter:
                     iteration=iteration, sink=sink.ref(), goal=coord_list(sink.cell),
                 )  # fmt: skip
             reserved = frozenset(c for later in order[index + 1 :] for c in approach_corridor(later))
+            if taps:
+                reserved |= taps - {sink.cell}
             path = self._search(request, state, tree_order, sink, reserved)
             if isinstance(path, RoutingFailure):
-                grid.release(net, keep=request.pins)
+                grid.release(net, keep=request.reserved_cells, keep_supports=request.tap_supports)
                 return sink, path
             self._commit(net, state, tree_order, path, sink)
             branch = RouteBranch(sink, path)
@@ -423,6 +516,8 @@ class NegotiatedRedstoneRouter:
                     goal=coord_list(branch.goal), path=[coord_list(c) for c in path],
                     length=branch.length,
                 )  # fmt: skip
+        if taps:
+            branches = [request.real_branch(b) for b in branches]
         return RouteTree(net, request.driver, root, tuple(branches))
 
     def _search(
@@ -445,6 +540,7 @@ class NegotiatedRedstoneRouter:
         budget = max(config.max_astar_expansions, config.expansions_per_block * distance)
         # A net that already needed a relaxed search this iteration starts there.
         mode = self._relax.get(net, NORMAL)
+        link = request.goal_link(sink)
         # Every search of this branch -- retries, relaxations, look-back
         # fallbacks -- draws on one effort budget, so a hopeless branch fails
         # fast and the attempt loop can spread the placement instead.
@@ -465,7 +561,7 @@ class NegotiatedRedstoneRouter:
                 max_expansions=min(budget * (2 if greedy else 1), effort - spent),
                 weight=max(config.astar_weight, config.greedy_astar_weight) if greedy else config.astar_weight,
                 history_weight=0.0 if ignore else 1.0, avoid=frozenset(avoid), reserved=reserved,
-                on_expand=expand_hook, on_blocked=blocked_hook,
+                goal_link=link, on_expand=expand_hook, on_blocked=blocked_hook,
             )  # fmt: skip
             # After a rejected path, look back along the path's own blocks.  A*
             # keeps one parent per block, so a path-dependent rule can prune a
@@ -509,7 +605,7 @@ class NegotiatedRedstoneRouter:
                 continue
             if result.path is None:
                 return self._branch_failed(net, sink, result.reason or "unreachable", result.expansions)
-            violation = validate_branch(state, result.path, sink.cell)
+            violation = validate_branch(state, result.path, sink.cell, link)
             if violation is None:
                 return result.path
             reason, cell = violation

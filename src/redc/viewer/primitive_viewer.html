@@ -98,6 +98,7 @@
           <option value="group">hierarchy group (subtree)</option>
           <option value="bus">logical bus (its one-bit nets)</option>
           <option value="port">port (its one-bit nets)</option>
+          <option value="timing">timing (clock tree, critical paths)</option>
         </select>
       </label>
       <select id="hl-item"></select>
@@ -119,12 +120,23 @@
       <label id="layer-probe"><input type="checkbox" data-layer="probe" checked> placement probe</label>
       <label><input type="checkbox" data-layer="bounds" checked> bounding boxes</label>
       <label><input type="checkbox" data-layer="grid" checked> grid</label>
+      <label><input type="checkbox" data-layer="signals" checked> simulated signals (playback)</label>
       <label>Congestion colours
         <select id="congestion-mode">
           <option value="kind" selected>by conflict kind</option>
           <option value="history">by congestion history</option>
         </select>
       </label>
+    </section>
+
+    <h2>Timing &amp; simulation</h2>
+    <section>
+      <div id="timing-panel" class="small"></div>
+      <div id="sim-controls" hidden>
+        <div class="row"><button id="btn-sim-play">&#x25B6; Play signals</button></div>
+        <input id="sim-tick" type="range" min="0" max="0" value="0" step="1" style="width:100%">
+        <div id="sim-info" class="muted small"></div>
+      </div>
     </section>
 
     <h2>Camera</h2>

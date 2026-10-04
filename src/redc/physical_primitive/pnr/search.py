@@ -109,6 +109,7 @@ def search_branch(
     avoid: frozenset[Coord] = frozenset(),
     reserved: frozenset[Coord] = frozenset(),
     lookback: int = 0,
+    goal_link: Coord | None = None,
     on_expand: ExpandHook | None = None,
     on_blocked: BlockedHook | None = None,
 ) -> SearchResult:
@@ -123,7 +124,9 @@ def search_branch(
     a trunk can never wall them off from their own net.
     ``lookback`` > 0 also checks every move against that many blocks of the
     path's own parent chain (supports, clearances, self-contact), catching
-    most of the non-Markovian rules before :func:`validate_branch` has to."""
+    most of the non-Markovian rules before :func:`validate_branch` has to.
+    ``goal_link``: the goal is a clock-tap entry whose tap continues to this
+    (already reserved) block -- the one own signal the goal may touch."""
     gx, gy, gz = goal_cell = goal.cell
     if not bounds.contains(goal_cell):
         return SearchResult(None, 0, "goal_out_of_bounds")
@@ -269,7 +272,7 @@ def search_branch(
             # Rule 1 (Markovian part): touch own signal blocks only via `cell`.
             own = adjacent.get(nxt)
             touching = own.get(net, 0) if own else 0
-            if not is_goal and nxt in goal_hood:
+            if not is_goal and nxt in goal_hood or is_goal and goal_link is not None:
                 touching -= 1
             if touching != (1 if from_tree else 0):
                 block(cell, nxt, "own_adjacency")
@@ -321,7 +324,9 @@ def search_branch(
     return SearchResult(None, expansions, "unreachable", blocked)
 
 
-def validate_branch(state: NetState, path: Sequence[Coord], goal: Coord) -> tuple[str, Coord] | None:
+def validate_branch(
+    state: NetState, path: Sequence[Coord], goal: Coord, goal_link: Coord | None = None
+) -> tuple[str, Coord] | None:
     """Re-check the non-Markovian intra-net rules on a found path.
 
     Returns ``(reason, offending NEW path block)`` -- a block the re-search can
@@ -345,7 +350,7 @@ def validate_branch(state: NetState, path: Sequence[Coord], goal: Coord) -> tupl
                 if abs(j - i) != 1:
                     return ("path_touches_itself", cell)
                 continue
-            if nb in own_signals:
+            if nb in own_signals and not (cell == goal and nb == goal_link):
                 return ("path_touches_own_net", cell)
     signals = set(path)
     steps = list(pairwise(path))

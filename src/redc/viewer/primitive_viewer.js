@@ -426,7 +426,7 @@ function newSearch(net, sink, goal) {
 }
 
 const LAYERS = ['components', 'pins', 'keepout', 'routes', 'partial', 'supports', 'clearances',
-  'congestion', 'search', 'probe', 'bounds', 'grid', 'selection'];
+  'congestion', 'search', 'probe', 'bounds', 'grid', 'signals', 'selection'];
 // The state versions each layer is drawn from.
 const LAYER_DEPS = {
   components: ['placed', 'highlight'],
@@ -440,6 +440,7 @@ const LAYER_DEPS = {
   probe: ['probe'],
   bounds: ['bounds'],
   grid: ['bounds'],
+  signals: ['signals'],
   selection: ['selection', 'placed', 'routes', 'partial'],
 };
 // Layers whose meshes answer clicks.
@@ -467,6 +468,7 @@ class Viewer {
     this.geomCache = new WeakMap();
     this.indexDesign();
     this.indexEvents();
+    this.indexTiming();
     this.layers = {};
     document.querySelectorAll('[data-layer]').forEach((box) => {
       this.layers[box.dataset.layer] = box.checked;
@@ -474,7 +476,7 @@ class Viewer {
     this.kindVisible = {};
     this.versions = {
       placed: 0, routes: 0, partial: 0, search: 0, congestion: 0, probe: 0, bounds: 0,
-      highlight: 0, selection: 0, kinds: 0, mode: 0,
+      highlight: 0, selection: 0, kinds: 0, mode: 0, signals: 0,
     };
     this.highlight = { active: false, inst: null, net: null, spec: null, label: '' };
     this.selection = null;
@@ -579,6 +581,16 @@ class Viewer {
         case 'pnr_attempt_end':
           this.milestones.push({ index: k, label: 'attempt ' + e.attempt + ' · ' + e.status });
           break;
+        case 'clock_tree_analyzed':
+          this.milestones.push({ index: k, label: 'attempt ' + attempt + ' · clock tree' });
+          break;
+        case 'timing_analyzed':
+          this.milestones.push({ index: k, label: 'attempt ' + attempt + ' · timing analysis' });
+          break;
+        case 'simulation_validated':
+        case 'simulation_failed':
+          this.milestones.push({ index: k, label: 'attempt ' + attempt + ' · redstone simulation' });
+          break;
         case 'route_search_expand':
         case 'route_transition_blocked':
           search = true;
@@ -593,6 +605,66 @@ class Viewer {
     });
     this.hasSearch = search || detailed; // anything for the search layer: frontier, goals, rejected paths
     this.hasProbe = this.events.some((e) => e.type === 'component_place_attempt');
+  }
+
+  // The timing / simulation reports of the final block, and the recorded
+  // signal playback (a short redstone simulation of the final design).
+  indexTiming() {
+    const f = this.final;
+    this.timing = f.timing && typeof f.timing === 'object' ? f.timing : null;
+    this.simulation = f.simulation && typeof f.simulation === 'object' ? f.simulation : null;
+    this.clockTree = f.clock_tree && typeof f.clock_tree === 'object' ? f.clock_tree : null;
+    const pb = f.simulation_playback;
+    this.playback = null;
+    if (pb && typeof pb === 'object' && Array.isArray(pb.dust) && Array.isArray(pb.devices)) {
+      const dust = pb.dust.filter((r) => Array.isArray(r) && r.length === 5);
+      const devices = pb.devices.filter((r) => Array.isArray(r) && r.length === 5);
+      dust.sort((a, b) => a[0] - b[0]);
+      devices.sort((a, b) => a[0] - b[0]);
+      this.playback = {
+        start: Number(pb.start_gt) || 0, end: Number(pb.end_gt) || 0, mode: pb.mode || '?',
+        initialDust: Array.isArray(pb.initial_dust) ? pb.initial_dust : [],
+        initialDevices: Array.isArray(pb.initial_devices) ? pb.initial_devices : [],
+        dust: dust, devices: devices, marks: Array.isArray(pb.marks) ? pb.marks : [], truncated: !!pb.truncated,
+      };
+    }
+    this.simTick = this.playback ? this.playback.start : 0;
+    this.simPlaying = false;
+    this.simSpeed = 20; // game ticks per second (Minecraft's own rate)
+    this.simAccum = 0;
+    this.signalCache = null;
+  }
+
+  // Dust strength and device on/off at game tick `t` of the playback:
+  // the initial snapshot plus every recorded change up to and including `t`.
+  signalState(t) {
+    const pb = this.playback;
+    if (!pb) return { dust: new Map(), devices: new Map(), marks: [] };
+    if (this.signalCache && this.signalCache.t === t) return this.signalCache;
+    const dust = new Map();
+    const devices = new Map();
+    pb.initialDust.forEach((r) => dust.set(coordKey(r), r[3]));
+    pb.initialDevices.forEach((r) => devices.set(coordKey(r), !!r[3]));
+    for (let i = 0; i < pb.dust.length && pb.dust[i][0] <= t; i++) {
+      const r = pb.dust[i];
+      dust.set(coordKey([r[1], r[2], r[3]]), r[4]);
+    }
+    for (let i = 0; i < pb.devices.length && pb.devices[i][0] <= t; i++) {
+      const r = pb.devices[i];
+      devices.set(coordKey([r[1], r[2], r[3]]), !!r[4]);
+    }
+    const marks = pb.marks.filter((m) => m && m.t === t);
+    this.signalCache = { t: t, dust: dust, devices: devices, marks: marks };
+    return this.signalCache;
+  }
+
+  setSimTick(t) {
+    const pb = this.playback;
+    if (!pb) return;
+    this.simTick = Math.max(pb.start, Math.min(pb.end, Math.round(Number(t) || 0)));
+    this.bump('signals');
+    this.sync();
+    this.updateSimUI();
   }
 
   // -- colours -----------------------------------------------------------------
@@ -937,6 +1009,37 @@ class Viewer {
         s.status = 'final: ' + e.nets + ' nets, ' + e.dust + ' dust, ' + e.repeaters + ' repeaters, ' + e.supports + ' supports';
         this.bump('bounds');
         break;
+      case 'clock_tree_analyzed':
+        s.status = 'clock tree: ' + (e.sinks || []).length + ' register clock pins, skew ' +
+          (e.skew ? e.skew.rt : '?') + ' rt before balancing';
+        break;
+      case 'clock_balanced':
+        // The balanced clock route replaces the legalized one.
+        if (e.realized) s.realized.set(e.net, e.realized);
+        s.status = 'clock balanced: skew ' + e.skew_before.rt + ' -> ' + e.skew_after.rt + ' rt (' +
+          e.repeaters_added + ' repeater(s) added, ' + e.repeaters_raised + ' raised, +' + e.delay_added_rt + ' rt)';
+        this.bump('routes');
+        break;
+      case 'clock_balance_failed':
+        s.status = 'clock balancing FAILED: ' + e.message;
+        break;
+      case 'timing_analyzed':
+      case 'timing_closed':
+        s.status = (e.type === 'timing_closed' ? 'timing closed: ' : 'timing analysed: ') + (e.sequential
+          ? 'clock period ' + (e.period ? e.period.rt : '?') + ' rt (' + e.mode + '), skew ' + (e.skew ? e.skew.rt : '?') +
+            ' rt, worst setup slack ' + (e.worst_setup_slack ? e.worst_setup_slack.gt : '-') + ' gt, worst hold slack ' +
+            (e.worst_hold_slack ? e.worst_hold_slack.gt : '-') + ' gt'
+          : 'combinational settle ' + (e.settle ? e.settle.rt : '?') + ' rt');
+        break;
+      case 'timing_failed':
+        s.status = 'timing FAILED: ' + (e.failures || []).map((x) => x.code + ' ' + x.message).join('; ');
+        break;
+      case 'simulation_validated':
+      case 'simulation_failed':
+        s.status = 'redstone simulation (' + e.mode + '): ' + (e.validated ? 'agrees with the primitive simulator' : 'FAILED') +
+          (e.cycles ? ', ' + e.cycles + ' logical cycles' : '') + (e.vectors ? ', ' + e.vectors + ' vectors' : '') +
+          (e.sim_events !== undefined ? ', ' + e.sim_events + ' events' : '');
+        break;
       case 'pnr_attempt_end':
         s.status = 'attempt ' + e.attempt + ' ' + e.status + (e.failure ? ': ' + e.failure.message : '');
         break;
@@ -1277,6 +1380,16 @@ class Viewer {
           if (target >= this.events.length) this.setPlaying(false);
         }
       }
+      if (this.simPlaying && this.playback) {
+        this.simAccum += dt * this.simSpeed;
+        const ticks = Math.floor(this.simAccum);
+        if (ticks > 0) {
+          this.simAccum -= ticks;
+          const next = Math.min(this.playback.end, this.simTick + ticks);
+          if (next >= this.playback.end) this.simPlaying = false;
+          this.setSimTick(next);
+        }
+      }
       this.controls.update(); // applies damping
       if (this.cameraMoved() || this.dirty) {
         this.dirty = false;
@@ -1340,6 +1453,7 @@ class Viewer {
       solid: { geometry: box, material: flat({}) },
       probe: { geometry: box, material: ghost(0.4) },
       sel: { geometry: box, material: flat({ transparent: true, opacity: 0.7, depthTest: false }), renderOrder: 10 },
+      glow: { geometry: box, material: flat({ transparent: true, opacity: 0.9, depthWrite: false }), renderOrder: 5 },
     };
   }
 
@@ -1483,6 +1597,7 @@ class Viewer {
       probe: (l) => this.buildProbe(l),
       bounds: (l) => this.buildBounds(l),
       grid: (l) => this.buildGrid(l),
+      signals: (l) => this.buildSignals(l),
       selection: (l) => this.buildSelection(l),
     });
     Object.keys(builders).forEach((name) => {
@@ -1648,6 +1763,25 @@ class Viewer {
     if (!p) return;
     // A tree whose next branch failed is drawn in the failure colour.
     this.emitWire(layer, 'partial', p.net, this.routeGeometry(p, false), null, false, p.failed ? this.colors.failure : null);
+  }
+
+  // Powered dust (brightness = signal strength) and active devices at the
+  // playback tick: a short redstone simulation of the final design.
+  buildSignals(layer) {
+    if (!this.playback) return;
+    const st = this.signalState(this.simTick);
+    const glow = this.batch(layer, 'glow');
+    st.dust.forEach((strength, key) => {
+      if (!(strength > 0)) return;
+      const c = key.split(',').map(Number);
+      const k = 0.35 + 0.65 * Math.min(15, strength) / 15;
+      glow.box(c[0] + 0.5, c[1] + 0.1, c[2] + 0.5, 0.44, 0.12, 0.44, [k, 0.07 * k, 0.04 * k], -1);
+    });
+    st.devices.forEach((on, key) => {
+      if (!on) return;
+      const c = key.split(',').map(Number);
+      glow.box(c[0] + 0.5, c[1] + 0.35, c[2] + 0.5, 0.36, 0.36, 0.36, [1, 0.86, 0.25], -1);
+    });
   }
 
   buildSupports(layer) {
@@ -2130,6 +2264,8 @@ class Viewer {
       } else if (spec.mode === 'bus') {
         (this.netsOfBus.get(spec.id) || []).forEach((n) => { net[n] = 1; inst[this.nets[n].driver.instance] = 1; });
         label = 'bus of ' + this.irLabel(spec.id);
+      } else if (spec.mode === 'timing') {
+        label = this.markTiming(spec.name, inst, net);
       } else if (spec.mode === 'port') {
         (this.netsOfPort.get(spec.name) || []).forEach((n) => { net[n] = 1; });
         const port = this.ports.find((p) => p.name === spec.name);
@@ -2148,8 +2284,44 @@ class Viewer {
     this.updateUI();
   }
 
+  // Mark the clock tree or the worst setup / hold path (nets and cells named
+  // by the timing report's path steps).
+  markTiming(which, inst, net) {
+    const N = this.instances.length;
+    const M = this.nets.length;
+    const mark = (steps) => (steps || []).forEach((st) => {
+      (st.nets || []).forEach((n) => { if (n >= 0 && n < M) net[n] = 1; });
+      const id = st.labels ? st.labels.instance : undefined;
+      if (id !== undefined && id >= 0 && id < N) inst[id] = 1;
+    });
+    const markLabels = (labels) => {
+      if (labels && labels.instance !== undefined && labels.instance >= 0 && labels.instance < N) inst[labels.instance] = 1;
+    };
+    if (which === 'clock') {
+      this.nets.forEach((n) => { if (n.role === 'clock') { net[n.id] = 1; inst[n.driver.instance] = 1; } });
+      this.instances.forEach((i) => { if (i.kind === 'register_bit') inst[i.id] = 1; });
+      return 'clock tree';
+    }
+    const t = this.timing;
+    const path = t ? (which === 'setup' ? (t.setup && t.setup.critical_path) : (t.hold && t.hold.critical_path)) ||
+      (which === 'setup' && t.combinational ? t.combinational.critical_path : null) : null;
+    if (!path) return 'no ' + which + ' path in this trace';
+    mark(path.steps);
+    mark(path.launch_clock_path);
+    mark(path.capture_clock_path);
+    markLabels(path.launch_register_labels);
+    markLabels(path.capture_register_labels);
+    return 'worst ' + which + ' path to ' + path.endpoint + ' (slack ' + (path.slack ? path.slack.gt + ' gt' : '-') + ')';
+  }
+
   highlightItems(mode) {
     const items = [];
+    if (mode === 'timing') {
+      items.push(['clock', 'clock tree (clock net + every register)']);
+      if (this.timing && (this.timing.setup || this.timing.combinational)) items.push(['setup', 'worst setup (critical) path']);
+      if (this.timing && this.timing.hold) items.push(['hold', 'worst hold path']);
+      return items;
+    }
     if (mode === 'ir_node') {
       const ids = Array.from(this.instByIrNode.keys()).sort((a, b) => a - b);
       ids.forEach((id) => items.push([String(id), 'n' + id + ' ' + this.irLabel(id).replace('IR node ' + id + ' ', '') +
@@ -2197,7 +2369,7 @@ class Viewer {
       this.fillHighlightItems(mode);
       this.hlFilled = mode;
     }
-    $('hl-item').value = spec ? String(spec.mode === 'port' ? spec.name : spec.id) : '';
+    $('hl-item').value = spec ? String(spec.mode === 'port' || spec.mode === 'timing' ? spec.name : spec.id) : '';
     $('hl-info').textContent = this.highlight.active ? this.highlight.label : 'nothing highlighted';
   }
 
@@ -2265,7 +2437,7 @@ class Viewer {
       const mode = $('hl-mode').value;
       const value = $('hl-item').value;
       if (value === '') return;
-      this.setHighlight(mode === 'port' ? { mode: mode, name: value } : { mode: mode, id: Number(value) });
+      this.setHighlight(mode === 'port' || mode === 'timing' ? { mode: mode, name: value } : { mode: mode, id: Number(value) });
     };
     $('btn-hl-clear').onclick = () => this.setHighlight(null);
     this.syncHighlightControls();
@@ -2287,6 +2459,7 @@ class Viewer {
       b.onclick = () => this.fit(b.dataset.view);
     });
     this.buildLegend();
+    this.buildTimingPanel();
 
     this.onKey = (ev) => {
       if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT')) return;
@@ -2303,6 +2476,95 @@ class Viewer {
       if (ev.preventDefault) ev.preventDefault();
     };
     window.addEventListener('keydown', this.onKey);
+  }
+
+  // The physical timing / simulation summary (from the final block).
+  buildTimingPanel() {
+    const box = $('timing-panel');
+    box.innerHTML = '';
+    const t = this.timing;
+    const sim = this.simulation;
+    const ticks = (r) => (r && r.gt !== null && r.gt !== undefined ? r.rt + ' rt (' + r.gt + ' gt)' : '-');
+    if (!t && !sim) {
+      box.appendChild(element('div', 'muted small', 'no timing report (the run stopped before timing closure)'));
+    }
+    if (t) {
+      const rows = [];
+      if (t.sequential && t.clock) {
+        rows.push(['clock period', ticks(t.clock.period) + ' · ' + t.clock.mode]);
+        rows.push(['required', ticks(t.clock.required_period)]);
+        rows.push(['clock arrival', ticks(t.clock.arrival_min) + ' .. ' + ticks(t.clock.arrival_max)]);
+        rows.push(['clock skew', ticks(t.clock.skew)]);
+        rows.push(['worst setup slack', ticks(t.setup && t.setup.worst_slack)]);
+        rows.push(['worst hold slack', ticks(t.hold && t.hold.worst_slack)]);
+        rows.push(['input offset', ticks(t.input_offset)]);
+      } else if (t.combinational) {
+        rows.push(['combinational settle', ticks(t.combinational.settle)]);
+      }
+      if (this.clockTree) {
+        rows.push(['clock balancing', this.clockTree.repeaters_added + ' repeater(s) added, ' + this.clockTree.repeaters_raised +
+          ' raised (+' + this.clockTree.delay_added_rt + ' rt); skew ' + this.clockTree.skew_before.rt + ' -> ' +
+          this.clockTree.skew_after.rt + ' rt']);
+      }
+      rows.push(['closure', t.closure && t.closure.passed ? 'passed' : 'FAILED ' +
+        ((t.closure && t.closure.failures) || []).map((x) => x.code).join(', ')]);
+      box.appendChild(table(rows));
+      const path = t.setup ? t.setup.critical_path : t.combinational ? t.combinational.critical_path : null;
+      if (path && Array.isArray(path.steps)) {
+        box.appendChild(element('div', 'muted small', 'critical path to ' + path.endpoint + ' (' + path.steps.length + ' steps)'));
+        const list = element('div', 'small');
+        path.steps.slice(0, 40).forEach((st) => {
+          const line = element('div', '', '+' + (st.edge_delay ? st.edge_delay.gt : 0) + ' gt → ' + (st.arrival ? st.arrival.gt : '?') + ' gt · ' + st.kind + ' ');
+          (st.nets || []).slice(0, 2).forEach((n) => line.appendChild(this.netLink(n)));
+          if (st.labels && st.labels.instance !== undefined) {
+            line.appendChild(linkButton('#' + st.labels.instance + ' ' + (st.labels.kind || ''), () => this.select({ kind: 'instance', id: st.labels.instance })));
+          }
+          list.appendChild(line);
+        });
+        box.appendChild(list);
+      }
+      const row = element('div', 'row');
+      [['clock', 'clock tree'], ['setup', 'setup path'], ['hold', 'hold path']].forEach((pair) => {
+        row.appendChild(linkButton('highlight ' + pair[1], () => this.setHighlight({ mode: 'timing', name: pair[0] })));
+      });
+      box.appendChild(row);
+    }
+    if (sim) {
+      box.appendChild(table([
+        ['simulation', (sim.mode || '?') + (sim.validated ? ' · validated' : sim.skipped ? ' · skipped' : ' · FAILED')],
+        ['model', (sim.model || '') + ' · ' + (sim.minecraft_version || '')],
+        ['checked', sim.cycles ? sim.cycles + ' logical cycles' : sim.vectors ? sim.vectors + ' input vectors' : '-'],
+      ]));
+    }
+    const pb = this.playback;
+    $('sim-controls').hidden = !pb;
+    if (pb) {
+      const slider = $('sim-tick');
+      slider.min = String(pb.start);
+      slider.max = String(pb.end);
+      slider.value = String(this.simTick);
+      slider.oninput = () => { this.simPlaying = false; this.setSimTick(Number(slider.value)); };
+      $('btn-sim-play').onclick = () => {
+        if (this.simTick >= pb.end) this.setSimTick(pb.start);
+        this.simPlaying = !this.simPlaying;
+        this.simAccum = 0;
+        this.updateSimUI();
+      };
+      this.updateSimUI();
+    }
+  }
+
+  updateSimUI() {
+    const pb = this.playback;
+    if (!pb) return;
+    $('sim-tick').value = String(this.simTick);
+    const st = this.signalState(this.simTick);
+    let powered = 0;
+    st.dust.forEach((v) => { if (v > 0) powered++; });
+    const marks = st.marks.map((m) => m.type + (m.component ? ' ' + m.component : '') + (m.port ? ' ' + m.port : '')).join(', ');
+    $('sim-info').textContent = 'game tick ' + this.simTick + ' (' + (this.simTick / 2) + ' rt) of ' + pb.start + '..' + pb.end +
+      ' · ' + powered + ' powered dust' + (marks ? ' · ' + marks : '') + (pb.truncated ? ' · (recording truncated)' : '');
+    $('btn-sim-play').textContent = this.simPlaying ? '\u23F8 Pause' : '\u25B6 Play signals';
   }
 
   jumpMilestone(direction) {

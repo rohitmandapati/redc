@@ -312,14 +312,20 @@ def assert_legal_design(run: Run) -> None:
         reports = {(r.sink.instance, r.sink.pin): r for r in route.sinks}
         assert sorted(reports) == sorted(tuple(s) for s in net.sinks)
         for goal, sink in sinks.items():
-            report, hops, cursor, repeaters = reports[tuple(sink)], 0, parent[goal], 0
+            report, hops, cursor, repeaters, delay = reports[tuple(sink)], 0, parent[goal], 0, 0
             while cursor is not None:
                 hops += 1
-                repeaters += kinds[cursor] is ElementKind.REPEATER
+                if kinds[cursor] is ElementKind.REPEATER:
+                    repeaters += 1
+                    setting = elements[cursor].setting
+                    assert setting in (1, 2, 3, 4)
+                    # Legalization inserts default repeaters; only clock balancing changes settings.
+                    assert setting == REPEATER_DELAY_TICKS or net.role == "clock"
+                    delay += setting
                 cursor = parent[cursor]
             assert (report.strength, report.required) == (level[goal], sites[sink].strength)
             assert (report.distance, report.repeaters) == (hops, repeaters)
-            assert report.delay_ticks == repeaters * REPEATER_DELAY_TICKS
+            assert report.delay_ticks == delay
 
     # -- global block legality: one owner per block, rules 1-3 and 6 -------------------
     for cell, net_id in signal.items():
@@ -407,41 +413,28 @@ def assert_metrics_consistent(run: Run, body, signal, support, clearance) -> Non
     assert m["final"]["volume"] == bounds.volume
     assert m["pnr"] == {"attempts": result.attempts, "attempt": result.geometry.attempt}
     assert result.attempts == result.geometry.attempt + 1
-    depth, ticks = timing_of(run)
-    assert m["logical"]["logic_depth"] == m["timing"]["logic_depth"] == depth
-    assert m["timing"]["critical_path_ticks"] == ticks
+    assert m["logical"]["logic_depth"] == m["timing"]["logic_depth"] == logic_depth_of(run)
     assert m["timing"]["state_elements"] == m["logical"]["register_bits"]
+    # Physical delay is the static timing analysis of the materialized world
+    # (redc.minecraft.sta); success requires closure and the simulator check.
+    assert m["timing"]["closure"] is True and m["timing"]["simulation_validated"] is True
+    assert m["timing"]["simulation_mode"] == "abstract-components"
+    assert m["timing"]["placeholder_estimate"] is True
 
 
-def timing_of(run: Run) -> tuple[int, int]:
-    """``(logic depth, critical path ticks)`` re-derived from the netlist and
-    the realized routes: gates count one level each (register bits, inputs and
-    constants are sources); a path's ticks are cell latencies plus the repeater
-    delay of every route it rides, up to an output, register or peripheral pin."""
-    logical, cells = run.mapped.logical, run.mapped.instances
+def logic_depth_of(run: Run) -> int:
+    """Logic depth re-derived from the netlist: gates count one level each
+    (register bits, inputs and constants are sources)."""
+    logical = run.mapped.logical
     driver = {(s.instance, s.pin): net.driver.instance for net in logical.nets for s in net.sinks}
-    reports = [r for route in run.result.realized.values() for r in route.sinks]
-    hop = {(r.sink.instance, r.sink.pin): r.delay_ticks for r in reports}
 
     @functools.cache
     def depth(inst: int) -> int:
         prim = logical.instances[inst]
         return 1 + max(depth(driver[(inst, pin)]) for pin in prim.inputs) if prim.kind in GATE_KINDS else 0
 
-    @functools.cache
-    def settled(inst: int) -> int:
-        prim, latency = logical.instances[inst], cells[inst].cell.latency or 0
-        if prim.kind not in GATE_KINDS:
-            return latency
-        return latency + max(settled(driver[(inst, pin)]) + hop[(inst, pin)] for pin in prim.inputs)
-
-    ends = (PrimitiveKind.OUTPUT_BIT, PrimitiveKind.REGISTER_BIT, PrimitiveKind.PERIPHERAL)
-    observed = [(i.id, pin) for i in logical.instances if i.kind in ends for pin in i.inputs]
     gates = [i.id for i in logical.instances if i.kind in GATE_KINDS]
-    return (
-        max((depth(g) for g in gates), default=0),
-        max((settled(driver[end]) + hop[end] for end in observed), default=0),
-    )
+    return max((depth(g) for g in gates), default=0)
 
 
 def assert_design_file(run: Run) -> None:
@@ -1197,6 +1190,7 @@ def test_attempt_geometry_grows_deterministically() -> None:
         "channel_width": (4, config.retry_channel_growth),
         "routing_margin": (5, config.retry_margin_growth),
         "max_y": (6, config.retry_height_growth),
+        "clock_tap": (config.clock_tap_length, config.retry_clock_tap_growth),
     }
     assert all(step > 0 for _, step in growth.values())  # by default every retry spreads out
     for attempt in range(3):
@@ -1206,6 +1200,7 @@ def test_attempt_geometry_grows_deterministically() -> None:
             assert getattr(geometry, name) == start + attempt * step, name
         assert geometry.to_dict() == {"attempt": attempt, **{n: getattr(geometry, n) for n in growth}}
     assert PrimitivePnRConfig(max_y=383).attempt_geometry(5).max_y == 383  # the world height caps growth
+    assert PrimitivePnRConfig(clock_tap_length=0).attempt_geometry(3).clock_tap == 0  # taps off stay off
 
 
 @pytest.mark.parametrize(("name", "iterations"), [("swapped_xor", 1), ("and", 0)])

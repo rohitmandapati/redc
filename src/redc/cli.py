@@ -332,6 +332,22 @@ def pnr(
         ),
     ] = None,
     interface: InterfaceOption = None,
+    clock_period: Annotated[
+        int | None,
+        typer.Option(
+            min=2,
+            help="physical-primitive only: clock period in redstone ticks (default: the smallest safe period, "
+            "chosen automatically; a given period is checked, never raised).",
+        ),
+    ] = None,
+    clock_margin: Annotated[
+        int | None,
+        typer.Option(min=0, help="physical-primitive only: redstone ticks added to the automatic period [1]."),
+    ] = None,
+    max_clock_skew: Annotated[
+        int | None,
+        typer.Option(min=0, help="physical-primitive only: largest accepted clock skew in redstone ticks [0]."),
+    ] = None,
 ) -> None:
     """Compile SOURCE, lower it with the chosen physical backend, then place
     and route it in 3D.
@@ -357,6 +373,9 @@ def pnr(
         max_height=max_height,
         channel_width=channel_width,
         interface=interface,
+        clock_period=clock_period,
+        clock_margin=clock_margin,
+        max_clock_skew=max_clock_skew,
     )
     try:
         check_options(target, options)

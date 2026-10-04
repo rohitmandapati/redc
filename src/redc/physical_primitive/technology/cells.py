@@ -14,11 +14,22 @@ LOCAL block coordinates with its signal flowing along local +x:
   enters or leaves along the pin's ``facing``.  Output pins state the signal
   ``strength`` they deliver there; input pins the minimum they need.
 * ``orientations`` -- the quarter turns placement may choose from.
-* ``latency`` -- propagation delay in redstone ticks (``None`` = unknown).
-  Latency is NOT state: only REGISTER_BIT cells are stateful.
+* ``timing`` -- the AUTHORITATIVE timing (:class:`~redc.minecraft.timing.ComponentTiming`):
+  explicit combinational arcs (pin -> pin, min / max) or sequential timing
+  (clk->Q, setup, hold, reset).  When omitted it is derived from ``latency``
+  as a declared PLACEHOLDER estimate.
+* ``latency`` -- a one-number display summary in redstone ticks (``None`` =
+  unknown); never used for timing analysis.  Latency is NOT state: only
+  REGISTER_BIT cells are stateful.
+* ``blocks`` -- the cell's materialized block-level structure (local
+  coordinates, one :class:`~redc.minecraft.blocks.MinecraftBlock` per
+  occupied voxel), or ``None`` for an ABSTRACT cell that the redstone
+  simulator can only treat as a declared black box.
 * ``structure`` -- a future NBT/structure reference; ``None`` today.
 * ``placeholder`` -- True for every cell until a real in-game circuit with
-  verified electrical behaviour replaces it.
+  verified electrical behaviour replaces it.  (Orthogonal to ``blocks``: a
+  materialized cell whose behaviour is only verified by RedC's own simulator
+  is still a placeholder.)
 
 :meth:`PrimitiveCell.oriented` rotates a cell once (cached); placement then
 only translates.
@@ -30,6 +41,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from ...minecraft.blocks import MinecraftBlock
+from ...minecraft.timing import ComponentTiming, SequentialTiming, uniform_arcs
+from ...minecraft.units import rt_to_gt
 from ...parser import CompileError
 from ..geometry import (
     ORIENTATIONS,
@@ -41,7 +55,7 @@ from ..geometry import (
     below,
     coord_list,
 )
-from ..netlist import PIN_INTERFACE, PeripheralDirection, PrimitiveKind
+from ..netlist import GATE_KINDS, PIN_INTERFACE, PeripheralDirection, PrimitiveKind
 from ..redstone import MAX_SIGNAL_STRENGTH, MIN_SIGNAL_Y, SIGNAL_NEIGHBORHOOD
 
 
@@ -103,6 +117,8 @@ class OrientedCell:
     keepout: frozenset[Coord]
     pins: dict[str, OrientedPin]
     bounds: Bounds
+    #: The rotated block structure (``None`` for an abstract cell).
+    blocks: tuple[tuple[Coord, MinecraftBlock], ...] | None = None
 
     def translate(self, origin: Coord) -> PlacedCell:
         ox, oy, oz = origin
@@ -137,6 +153,12 @@ class PlacedCell:
     def voxels(self) -> list[tuple[Coord, str]]:
         return [(add(c, self.origin), role) for c, role in self.oriented.voxels]
 
+    def world_blocks(self) -> list[tuple[Coord, MinecraftBlock]] | None:
+        """The materialized blocks in world coordinates (``None`` = abstract cell)."""
+        if self.oriented.blocks is None:
+            return None
+        return [(add(c, self.origin), block) for c, block in self.oriented.blocks]
+
 
 @dataclass(frozen=True)
 class PrimitiveCell:
@@ -154,6 +176,8 @@ class PrimitiveCell:
     #: ``(kind, direction, width)`` of a PERIPHERAL cell, else ``None``.
     peripheral: tuple[str, PeripheralDirection, int] | None = None
     description: str = ""
+    timing: ComponentTiming | None = None
+    blocks: tuple[tuple[Coord, MinecraftBlock], ...] | None = None
     _oriented: dict[int, OrientedCell] = field(
         default_factory=dict, init=False, repr=False, compare=False, hash=False
     )
@@ -197,6 +221,50 @@ class PrimitiveCell:
                                 f"(pins {first.name!r} and {second.name!r})"
                             )
         self._check_interface(where)
+        if self.timing is None:
+            object.__setattr__(self, "timing", placeholder_timing(self.kind, self.latency, self.pins))
+        self._check_timing(where)
+        if self.blocks is not None:
+            self._check_blocks(occ, where)
+
+    def _check_timing(self, where: str) -> None:
+        timing = self.timing
+        if timing is None:
+            return  # unknown timing: allowed, but such a cell can be neither simulated nor timed
+        ins = {p.name for p in self.pins if p.direction == "in"}
+        outs = {p.name for p in self.pins if p.direction == "out"}
+        for arc in timing.arcs:
+            if arc.from_pin not in ins or arc.to_pin not in outs:
+                raise CompileError(f"{where}: timing arc {arc.from_pin} -> {arc.to_pin} names unknown pins")
+        seq = timing.sequential
+        if seq is not None and self.kind is not PrimitiveKind.REGISTER_BIT:
+            raise CompileError(f"{where}: only register-bit cells carry sequential timing")
+        if self.kind is PrimitiveKind.REGISTER_BIT:
+            if seq is None or timing.arcs:
+                raise CompileError(f"{where}: a register needs sequential timing and no combinational arcs")
+            if (seq.data_pin, seq.clock_pin, seq.reset_pin, seq.q_pin) != ("d", "clk", "rst", "q"):
+                raise CompileError(f"{where}: register timing must name pins d / clk / rst / q")
+        if self.kind in GATE_KINDS:
+            have = {(a.from_pin, a.to_pin) for a in timing.arcs}
+            want = {(i, o) for i in ins for o in outs}
+            if have != want:
+                raise CompileError(f"{where}: a gate needs one timing arc per input -> output, got {sorted(have)}")
+            if any(a.min_gt < 1 for a in timing.arcs):
+                raise CompileError(f"{where}: gate arcs must delay at least one game tick")
+
+    def _check_blocks(self, occ: frozenset[Coord], where: str) -> None:
+        assert self.blocks is not None
+        coords = [c for c, _ in self.blocks]
+        if len(set(coords)) != len(coords) or set(coords) != occ:
+            raise CompileError(f"{where}: the block structure must give exactly one block per occupied voxel")
+        for coord, block in self.blocks:
+            if not isinstance(block, MinecraftBlock):
+                raise CompileError(f"{where}: structure entry at {list(coord)} is not a MinecraftBlock")
+
+    @property
+    def materialized(self) -> bool:
+        """Whether the cell has a block-level implementation (else it is ABSTRACT)."""
+        return self.blocks is not None
 
     def _check_pin(self, pin: PrimitivePin, occ: frozenset[Coord], where: str) -> None:
         if pin.direction not in ("in", "out"):
@@ -265,7 +333,11 @@ class PrimitiveCell:
         }
         bounds = Bounds.of([*occupied, *keepout, *(p.position for p in pins.values())])
         assert bounds is not None
-        oriented = OrientedCell(self, orientation, voxels, occupied, keepout, pins, bounds)
+        blocks = None
+        if self.blocks is not None:
+            turns = orientation.quarter_turns
+            blocks = tuple((rot(c), b.rotated(turns)) for c, b in self.blocks)
+        oriented = OrientedCell(self, orientation, voxels, occupied, keepout, pins, bounds, blocks)
         self._oriented[orientation.quarter_turns] = oriented
         return oriented
 
@@ -277,6 +349,11 @@ class PrimitiveCell:
             "placeholder": self.placeholder,
             "structure": self.structure,
             "latency": self.latency,
+            "timing": None if self.timing is None else self.timing.to_dict(),
+            "materialized": self.materialized,
+            "structure_blocks": None
+            if self.blocks is None
+            else [{"coord": coord_list(c), "block": str(b)} for c, b in self.blocks],
             "stateful": self.kind is PrimitiveKind.REGISTER_BIT,
             "description": self.description,
             "orientations": [o.name for o in self.orientations],
@@ -301,6 +378,7 @@ def placeholder_cell(
     description: str,
     body_role: str = "body",
     peripheral: tuple[str, PeripheralDirection, int] | None = None,
+    timing: ComponentTiming | None = None,
 ) -> PrimitiveCell:
     """Build a deterministic PLACEHOLDER cell from a body and pins.
 
@@ -339,7 +417,32 @@ def placeholder_cell(
         latency=latency,
         description=description,
         peripheral=peripheral,
+        timing=timing,
     )
+
+
+def placeholder_timing(
+    kind: PrimitiveKind, latency: int | None, pins: tuple[PrimitivePin, ...]
+) -> ComponentTiming | None:
+    """The DECLARED placeholder timing of a cell from its estimated latency
+    (redstone ticks): every input -> output arc of a gate takes ``latency``;
+    a register's clk->Q and reset->Q take ``latency`` with one redstone tick of
+    setup, hold and reset recovery.  Pads, constants, clock / reset sources and
+    peripherals have no arcs (they are sources or observation points).
+    ``None`` if a gate's or register's latency is unknown."""
+    if kind in GATE_KINDS:
+        if latency is None:
+            return None
+        ins = [p.name for p in pins if p.direction == "in"]
+        outs = [p.name for p in pins if p.direction == "out"]
+        return ComponentTiming(uniform_arcs(ins, outs, rt_to_gt(latency)))
+    if kind is PrimitiveKind.REGISTER_BIT:
+        if latency is None:
+            return None
+        delay = rt_to_gt(latency)
+        one = rt_to_gt(1)
+        return ComponentTiming(sequential=SequentialTiming("clk", "d", "q", "rst", delay, delay, one, one, delay, one))
+    return ComponentTiming()
 
 
 __all__ = [
@@ -349,4 +452,5 @@ __all__ = [
     "PrimitiveCell",
     "PrimitivePin",
     "placeholder_cell",
+    "placeholder_timing",
 ]

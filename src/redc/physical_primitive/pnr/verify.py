@@ -26,12 +26,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ...minecraft.timing import REPEATER_DELAYS_RT, repeater_delay_gt
+from ...minecraft.units import gt_to_rt
 from ..geometry import Coord, coord_list
 from ..physical import PrimitivePhysicalNetlist
 from ..redstone import (
     MAX_SIGNAL_STRENGTH,
     MIN_SIGNAL_Y,
-    REPEATER_DELAY_TICKS,
     SIGNAL_NEIGHBORHOOD,
     ElementKind,
     clearance_of,
@@ -271,8 +272,15 @@ def verify_design(
             element = kinds[cell]
             if up is None:
                 delay[cell] = 0
+            elif kinds[up].kind is ElementKind.REPEATER and kinds[up].setting in REPEATER_DELAYS_RT:
+                delay[cell] = delay[up] + gt_to_rt(repeater_delay_gt(kinds[up].setting or 1))
             else:
-                delay[cell] = delay[up] + (REPEATER_DELAY_TICKS if kinds[up].kind is ElementKind.REPEATER else 0)
+                delay[cell] = delay[up]
+            if (element.kind is ElementKind.REPEATER) != (element.setting is not None) or (
+                element.setting is not None and element.setting not in REPEATER_DELAYS_RT
+            ):
+                bad("repeater_setting", f"net {net_id} block {coord_list(cell)} has repeater delay "
+                    f"{element.setting!r} (a repeater needs 1..4 rt, dust none)", (cell,), (net_id,))  # fmt: skip
             if element.delay != delay[cell]:
                 bad("delay_record", f"net {net_id} records delay {element.delay} at {coord_list(cell)}, "
                     f"actual {delay[cell]}", (cell,), (net_id,))  # fmt: skip

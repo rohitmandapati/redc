@@ -9,7 +9,9 @@ decides WHAT each block is, honouring Minecraft's finite signal strength:
 * the driver's cell delivers ``strength`` (usually 15) into the root pin dust;
 * every further dust block along the DIRECTED tree (root -> sinks) is one
   weaker; a repeater instead re-drives the block in front of it to 15 and
-  delays by :data:`~redc.physical_primitive.redstone.REPEATER_DELAY_TICKS`;
+  delays by its configured setting (legalization inserts
+  :data:`~redc.physical_primitive.redstone.REPEATER_DELAY_TICKS`; clock-tree
+  balancing may raise it to 4 or add repeaters -- see :func:`realize_route`);
 * every dust block must stay at strength >= 1 and every sink pin at or above
   the sink cell's required strength.
 
@@ -26,9 +28,12 @@ constant-0 anchor) needs no repeaters.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from ...minecraft.timing import repeater_delay_gt
+from ...minecraft.units import gt_to_rt
 from ..geometry import Coord, Direction, coord_list
 from ..grid import PinSite
 from ..redstone import MAX_SIGNAL_STRENGTH, REPEATER_DELAY_TICKS, ElementKind
@@ -42,7 +47,8 @@ class RouteElement:
     ``minecraft:repeater[facing=...]`` blockstate names the INPUT side -- the
     opposite -- which is exported separately as ``blockstate_facing``.
     ``strength`` is a dust block's signal strength (a repeater's INPUT strength)
-    when the driver is on; ``delay`` the repeater ticks between root and here."""
+    when the driver is on; ``delay`` the redstone ticks of repeater delay
+    between root and here; ``setting`` a repeater's own delay (1..4 rt)."""
 
     coord: Coord
     kind: ElementKind
@@ -50,6 +56,7 @@ class RouteElement:
     strength: int
     delay: int
     facing: Direction | None = None
+    setting: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         record: dict[str, Any] = {
@@ -62,6 +69,8 @@ class RouteElement:
         if self.facing is not None:
             record["facing"] = self.facing.label
             record["blockstate_facing"] = self.facing.opposite.label
+        if self.setting is not None:
+            record["repeater_delay"] = self.setting
         return record
 
 
@@ -218,16 +227,31 @@ def legalize_route(tree: RouteTree, request: RouteRequest) -> RealizedRoute | Le
                 tree.net, "signal too weak and no repeater site upstream", weak, sink, tuple(upstream)
             )
         repeaters.add(site)
-    strength = signal_levels(tree, drive, repeaters) if powered else {c: 0 for c in tree.cells}
+    return realize_route(tree, request, {c: REPEATER_DELAY_TICKS for c in repeaters})
+
+
+def realize_route(tree: RouteTree, request: RouteRequest, repeaters: Mapping[Coord, int]) -> RealizedRoute:
+    """Type every block of ``tree`` given the repeater sites and their delay
+    settings (redstone ticks).  Strength and per-sink delay are recomputed
+    from scratch; the caller guarantees every site is eligible."""
+    drive = request.driver.strength
+    powered = drive > 0
+    sites = set(repeaters)
+    strength = signal_levels(tree, drive, sites) if powered else {c: 0 for c in tree.cells}
     delay: dict[Coord, int] = {}
     elements: list[RouteElement] = []
     for cell in tree.cells:
         up = tree.parent[cell]
-        delay[cell] = 0 if up is None else delay[up] + (REPEATER_DELAY_TICKS if up in repeaters else 0)
+        if up is None:
+            delay[cell] = 0
+        else:
+            delay[cell] = delay[up] + (gt_to_rt(repeater_delay_gt(repeaters[up])) if up in repeaters else 0)
         if cell in repeaters:
             (child,) = tree.children[cell]
             facing = Direction.of((child[0] - cell[0], 0, child[2] - cell[2]))
-            elements.append(RouteElement(cell, ElementKind.REPEATER, up, strength[cell], delay[cell], facing))
+            elements.append(
+                RouteElement(cell, ElementKind.REPEATER, up, strength[cell], delay[cell], facing, repeaters[cell])
+            )
         else:
             elements.append(RouteElement(cell, ElementKind.DUST, up, strength[cell], delay[cell]))
     sinks = []
@@ -256,5 +280,6 @@ __all__ = [
     "RouteElement",
     "SinkReport",
     "legalize_route",
+    "realize_route",
     "repeater_eligible",
 ]
