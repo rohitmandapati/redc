@@ -192,7 +192,16 @@ searched, the approach corridors of the net's still-unreached sinks are
 reserved so its own trunk cannot wall them in; a branch that exhausts its
 (distance-scaled) expansion budget under congestion pricing is searched again
 ignoring congestion, and a net that still walls in a sink is re-routed with
-that sink first.
+that sink first. Every branch draws on one effort budget across its retries.
+
+A doomed attempt is given up early and retried with wider spacing, by three
+deterministic, configurable rules that never change what counts as legal:
+`diverged` (conflicts climb above 4x the fewest seen plus 50 -- typically a
+congestion-ignoring fallback cascading), `stagnated` (no new fewest-conflicts
+for 8 iterations) and `effort_exhausted` (total A* expansions above
+max(5M, 60k per net)). Each abort is a `routing_aborted` trace event, and the
+per-attempt effort (searches, expansions, fallbacks, restarts, per-iteration
+and per-net counts) is reported in `metrics.routing.effort`.
 
 The **redstone model** (`redstone.py`) is explicit and conservative:
 

@@ -707,8 +707,9 @@ def reference_signatures(trace: dict, max_cells: int = MAX_SEARCH_CELLS) -> list
         elif kind == "keyframe":  # replaces all routes
             routes = {r["net"]: r for r in e["routes"]}
             partial = None
-        elif kind == "route_realized":
+        elif kind == "route_realized":  # a realized net's legalization failure is superseded
             realized[e["net"]] = e
+            failures = [f for f in failures if f != ["legalization", e["net"]]]
         out.append(signature())
     return out
 

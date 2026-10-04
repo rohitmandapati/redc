@@ -28,5 +28,6 @@ dev = [
     "hypothesis>=6.168.3",
     "mypy>=2.3.1",
     "pytest>=9.1.1",
+    "quickjs>=1.19.4",
     "ruff>=0.16.9",
 ]

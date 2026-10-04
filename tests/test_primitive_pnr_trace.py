@@ -182,6 +182,7 @@ EVENT_FIELDS = {
     "congestion_snapshot": {"iteration", "present_factor", "conflicts", "cells", "history_cells"},
     "physical_conflict": {"iteration", "kind", "cells", "nets"},
     "keyframe": {"iteration", "placement", "routes", "realized", "congestion"},
+    "routing_aborted": {"iteration", "reason", "detail", "expansions"},
     "routing_complete": {"iteration", "iterations", "routed_nets", "rip_ups", "failure"},
     "routing_failed": {"iteration", "iterations", "routed_nets", "rip_ups", "failure"},
     "legalization_begin": {"round", "nets"},
@@ -614,7 +615,8 @@ def test_event_payloads_carry_the_documented_fields() -> None:
     assert set(EVENT_FIELDS) == set(table), sorted(set(EVENT_FIELDS) ^ set(table))
     # Events that only a forced failure produces are covered by the tests below.
     assert set(table) - checked <= {"component_place_rejected", "legalization_failed", "illegal_transition",
-                                    "branch_path_rejected", "physical_conflict", "net_route_restarted"}  # fmt: skip
+                                    "branch_path_rejected", "physical_conflict", "net_route_restarted",
+                                    "routing_aborted"}  # fmt: skip
 
 
 #: ``(event type, key)`` pairs where a coordinate-list key holds a COUNT instead.

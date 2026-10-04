@@ -684,12 +684,17 @@ class Viewer {
     Object.keys(this.versions).forEach((k) => { this.versions[k]++; });
   }
 
-  // A net that routed after all no longer shows its earlier branch failures.
-  dropRoutingFailures(s, net) {
-    if (s.failures.some((f) => f.kind === 'routing' && f.net === net)) {
-      s.failures = s.failures.filter((f) => !(f.kind === 'routing' && f.net === net));
+  // A net that routed (or was realized) after all no longer shows its earlier
+  // failures of that kind.
+  dropFailures(s, net, kind) {
+    if (s.failures.some((f) => f.kind === kind && f.net === net)) {
+      s.failures = s.failures.filter((f) => !(f.kind === kind && f.net === net));
       this.bump('congestion');
     }
+  }
+
+  dropRoutingFailures(s, net) {
+    this.dropFailures(s, net, 'routing');
   }
 
   clearSearch(s) {
@@ -814,11 +819,14 @@ class Viewer {
         break;
       case 'branch_search_stats':
         s.status = 'net ' + e.net + ' -> #' + e.sink.instance + '.' + e.sink.pin + ': ' + e.expansions +
-          ' expansions' + (e.relaxed ? ' (relaxed)' : '') + ', ' + (e.found ? 'found' : 'not found');
+          ' expansions' + (e.mode && e.mode !== 'normal' ? ' (' + e.mode + ' search)' : '') + ', ' +
+          (e.found ? 'found' : 'not found');
         break;
       case 'branch_search_relaxed':
         s.status = 'net ' + e.net + ' -> #' + e.sink.instance + '.' + e.sink.pin + ': budget spent after ' +
-          e.expansions + ' expansions under congestion pricing; searching again ignoring congestion';
+          e.expansions + ' expansions; ' + (e.mode === 'greedy'
+            ? 'searching again in greedy mode (higher A* weight, congestion still priced)'
+            : 'searching again ignoring congestion (last resort)');
         break;
       case 'branch_path_rejected':
         s.rejected = e;
@@ -912,6 +920,7 @@ class Viewer {
         break;
       case 'route_realized':
         s.realized.set(e.net, e);
+        this.dropFailures(s, e.net, 'legalization');
         s.status = 'net ' + e.net + ' realized: ' + (e.elements || []).length + ' blocks, ' + (e.repeaters || []).length + ' repeater(s)';
         this.bump('routes');
         break;
@@ -1804,9 +1813,11 @@ class Viewer {
     if (!ref) return;
     const sx = ref.max[0] - ref.min[0] + 1;
     const sz = ref.max[2] - ref.min[2] + 1;
+    // A square helper whose low corner sits on a block boundary one block
+    // outside the bounds, so every line falls on an integer coordinate.
     const size = Math.max(sx, sz) + 2;
     const grid = new THREE.GridHelper(size, size, 0x3a4756, 0x232c36);
-    grid.position.set(ref.min[0] + sx / 2, 0, ref.min[2] + sz / 2);
+    grid.position.set(ref.min[0] - 1 + size / 2, 0, ref.min[2] - 1 + size / 2);
     this.addExtra(layer, grid);
   }
 

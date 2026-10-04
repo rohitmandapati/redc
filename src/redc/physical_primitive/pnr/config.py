@@ -65,6 +65,17 @@ class PrimitivePnRConfig:
     #: Total expansions one branch may spend over all its retries, as a
     #: multiple of its single-search budget (a hopeless branch fails fast).
     branch_effort: int = 4
+    #: Early abort of a nonviable attempt (0 disables each rule).  They only
+    #: decide when to give up and retry wider; legality is never relaxed.
+    #: Diverged: conflicts > factor * fewest-so-far + margin.
+    abort_divergence_factor: float = 4.0
+    abort_divergence_margin: int = 50
+    #: Stagnated: no new fewest-conflicts for this many iterations.
+    abort_stagnation_iterations: int = 8
+    #: Effort exhausted: total A* expansions of the attempt above
+    #: max(attempt_effort_min, attempt_effort_per_net * nets).
+    attempt_effort_per_net: int = 60_000
+    attempt_effort_min: int = 5_000_000
     #: Present-congestion factor of the first pass, multiplied each iteration.
     present_factor_initial: float = 0.5
     present_factor_growth: float = 1.6
@@ -102,7 +113,8 @@ class PrimitivePnRConfig:
         for name in (
             "component_spacing", "channel_width", "routing_margin", "max_routing_iterations",
             "max_path_retries", "search_lookback", "branch_effort", "max_sink_order_restarts",
-            "max_legalization_rounds", "retry_spacing_growth",
+            "max_legalization_rounds", "abort_divergence_margin", "abort_stagnation_iterations",
+            "attempt_effort_per_net", "attempt_effort_min", "retry_spacing_growth",
             "retry_channel_growth", "retry_margin_growth", "retry_height_growth",
             "keyframe_interval", "max_blocked_events_per_branch",
         ):  # fmt: skip
@@ -114,6 +126,8 @@ class PrimitivePnRConfig:
             raise CompileError("expansions_per_block must be >= 0 and the A* weights >= 1")
         if self.present_factor_initial < 0 or self.present_factor_growth < 1:
             raise CompileError("present factor must start >= 0 and grow by >= 1x")
+        if self.abort_divergence_factor < 0:
+            raise CompileError("abort_divergence_factor must be non-negative")
         if self.history_increment < 0 or self.vertical_cost < 0:
             raise CompileError("history_increment and vertical_cost must be non-negative")
         object.__setattr__(self, "trace_level", TraceLevel.parse(self.trace_level))
@@ -141,6 +155,11 @@ class PrimitivePnRConfig:
             "astar_weight": self.astar_weight,
             "greedy_astar_weight": self.greedy_astar_weight,
             "branch_effort": self.branch_effort,
+            "abort_divergence_factor": self.abort_divergence_factor,
+            "abort_divergence_margin": self.abort_divergence_margin,
+            "abort_stagnation_iterations": self.abort_stagnation_iterations,
+            "attempt_effort_per_net": self.attempt_effort_per_net,
+            "attempt_effort_min": self.attempt_effort_min,
             "present_factor_initial": self.present_factor_initial,
             "present_factor_growth": self.present_factor_growth,
             "history_increment": self.history_increment,

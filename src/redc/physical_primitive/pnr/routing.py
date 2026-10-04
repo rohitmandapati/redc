@@ -174,8 +174,10 @@ class RouteTree:
 
 @dataclass(frozen=True)
 class RoutingFailure:
-    """Why routing gave up: ``unroutable`` (a branch search failed) or
-    ``congestion`` (conflicts remained after the last iteration)."""
+    """Why routing gave up: ``unroutable`` (a branch search failed),
+    ``congestion`` (conflicts remained after the last iteration), or an early
+    abort of a nonviable attempt -- ``diverged``, ``stagnated`` or
+    ``effort_exhausted`` (see :class:`NegotiatedRedstoneRouter`)."""
 
     reason: str
     iteration: int
@@ -184,6 +186,7 @@ class RoutingFailure:
     search: str | None = None
     expansions: int = 0
     conflicts: tuple[Conflict, ...] = ()
+    detail: str = ""
 
     @property
     def message(self) -> str:
@@ -192,6 +195,8 @@ class RoutingFailure:
                 f"routing did not converge: {len(self.conflicts)} redstone conflicts remain after "
                 f"iteration {self.iteration}"
             )
+        if self.reason in ABORT_REASONS:
+            return f"routing aborted in iteration {self.iteration} ({self.reason}): {self.detail}"
         where = f" to primitive {self.sink.instance} pin {self.sink.pin!r}" if self.sink else ""
         return (
             f"net {self.net}{where} is unroutable in iteration {self.iteration} "
@@ -208,6 +213,44 @@ class RoutingFailure:
             "search": self.search,
             "expansions": self.expansions,
             "conflicts": [c.to_dict() for c in self.conflicts[:200]],
+            "detail": self.detail,
+        }
+
+
+#: Early-abort reasons: the attempt is judged nonviable and the P&R driver
+#: retries with wider spacing.  They never change what counts as legal.
+ABORT_REASONS = ("diverged", "stagnated", "effort_exhausted")
+
+
+@dataclass
+class RouterEffort:
+    """Where one routing run spent its effort (deterministic counts, no clocks)."""
+
+    searches: int = 0
+    expansions: int = 0
+    path_rejections: int = 0
+    greedy_fallbacks: int = 0
+    ignore_congestion_fallbacks: int = 0
+    net_restarts: int = 0
+    branch_failures: int = 0
+    nets_routed: int = 0
+    per_net_expansions: dict[int, int] = field(default_factory=dict)
+    #: One record per finished iteration (see :meth:`to_dict`).
+    iterations: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        top = sorted(self.per_net_expansions.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+        return {
+            "searches": self.searches,
+            "expansions": self.expansions,
+            "path_rejections": self.path_rejections,
+            "greedy_fallbacks": self.greedy_fallbacks,
+            "ignore_congestion_fallbacks": self.ignore_congestion_fallbacks,
+            "net_restarts": self.net_restarts,
+            "branch_failures": self.branch_failures,
+            "nets_routed": self.nets_routed,
+            "top_nets_by_expansions": [{"net": n, "expansions": e} for n, e in top],
+            "iterations": self.iterations,
         }
 
 
@@ -220,6 +263,7 @@ class RoutingOutcome:
     rip_ups: int
     failure: RoutingFailure | None = None
     conflicts: list[Conflict] = field(default_factory=list)
+    effort: RouterEffort = field(default_factory=RouterEffort)
 
 
 #: Branch-search modes, escalated when a branch exhausts its expansion budget.
@@ -274,6 +318,14 @@ class NegotiatedRedstoneRouter:
         self.rip_ups = 0
         #: net -> search mode it needed this iteration (reset every iteration).
         self._relax: dict[int, int] = {}
+        self.effort = RouterEffort()
+        self._iteration_mark = (0, 0, 0)  # (searches, expansions, rip-ups) at iteration start
+        #: Expansion backstop for the whole attempt (0 = unlimited).
+        self.effort_cap = (
+            max(config.attempt_effort_min, config.attempt_effort_per_net * len(requests))
+            if config.attempt_effort_per_net
+            else 0
+        )
         for request in self.order:
             for site in (request.driver, *request.sinks):
                 grid.claim_signal(request.net, site.cell)
@@ -316,10 +368,16 @@ class NegotiatedRedstoneRouter:
             if not isinstance(outcome, tuple):
                 break
             failed, failure = outcome
-            if restarts >= self.config.max_sink_order_restarts or len(order) < 2 or order[0] == failed:
+            if (
+                restarts >= self.config.max_sink_order_restarts
+                or len(order) < 2
+                or order[0] == failed
+                or failure.reason in ABORT_REASONS
+            ):
                 return failure
             # The net may have walled in its own sink: route that sink first.
             restarts += 1
+            self.effort.net_restarts += 1
             order = [failed] + [s for s in order if s != failed]
             if trace:
                 trace.emit(
@@ -327,6 +385,7 @@ class NegotiatedRedstoneRouter:
                     first_sink=failed.ref(), restart=restarts,
                 )  # fmt: skip
         tree = outcome
+        self.effort.nets_routed += 1
         if trace:
             trace.emit("routing", "net_route_committed", iteration=iteration, **tree.to_dict())
         return tree
@@ -391,6 +450,11 @@ class NegotiatedRedstoneRouter:
         # fast and the attempt loop can spread the placement instead.
         effort, spent = budget * max(1, config.branch_effort), 0
         for attempt in range(config.max_path_retries + 3):
+            if self.effort_cap and self.effort.expansions >= self.effort_cap:
+                return self._abort(
+                    "effort_exhausted",
+                    f"{self.effort.expansions} A* expansions exceed the attempt cap of {self.effort_cap}",
+                )
             if spent >= effort:
                 return self._branch_failed(net, sink, "effort_limit", spent)
             greedy, ignore = mode >= GREEDY, mode >= IGNORE_CONGESTION
@@ -409,16 +473,20 @@ class NegotiatedRedstoneRouter:
             # only, and a look-back search that finds nothing is redone
             # without it.
             lookback = config.search_lookback if avoid else 0
+            before = spent
             result = search(lookback=lookback)
             spent += result.expansions
+            searches = 1
             if result.path is None and lookback and spent < effort:
                 result = search(lookback=0, max_expansions=min(budget * (2 if greedy else 1), effort - spent))
                 spent += result.expansions
+                searches += 1
+            self._count(net, searches, spent - before)
             if trace and trace.wants(TraceLevel.DETAILED):
                 trace.emit(
                     "routing", "branch_search_stats", level=TraceLevel.DETAILED, net=net,
                     iteration=iteration, sink=sink.ref(), attempt=attempt, mode=SEARCH_MODES[mode],
-                    expansions=result.expansions, found=result.found,
+                    expansions=spent - before, found=result.found,
                     blocked=dict(sorted(result.blocked.items())),
                 )  # fmt: skip
             if result.path is None and result.reason == "expansion_limit" and mode < IGNORE_CONGESTION:
@@ -429,6 +497,10 @@ class NegotiatedRedstoneRouter:
                 # iterations push the temporary overlap apart.
                 mode += 1
                 self._relax[net] = max(self._relax.get(net, NORMAL), mode)
+                if mode == GREEDY:
+                    self.effort.greedy_fallbacks += 1
+                else:
+                    self.effort.ignore_congestion_fallbacks += 1
                 if trace:
                     trace.emit(
                         "routing", "branch_search_relaxed", net=net, iteration=iteration,
@@ -442,6 +514,7 @@ class NegotiatedRedstoneRouter:
                 return result.path
             reason, cell = violation
             avoid.add(cell)
+            self.effort.path_rejections += 1
             if trace and trace.wants(TraceLevel.DETAILED):
                 trace.emit(
                     "routing", "branch_path_rejected", level=TraceLevel.DETAILED, net=net,
@@ -450,7 +523,24 @@ class NegotiatedRedstoneRouter:
                 )  # fmt: skip
         return self._branch_failed(net, sink, "intra_net_conflict", spent)
 
+    def _abort(self, reason: str, detail: str, conflicts: Sequence[Conflict] = ()) -> RoutingFailure:
+        """Give up on this attempt early (deterministically) with ``reason``."""
+        failure = RoutingFailure(reason, self.iteration, conflicts=tuple(conflicts), detail=detail)
+        if self.trace:
+            self.trace.emit(
+                "routing", "routing_aborted", iteration=self.iteration, reason=reason, detail=detail,
+                expansions=self.effort.expansions,
+            )  # fmt: skip
+        return failure
+
+    def _count(self, net: int, searches: int, expansions: int) -> None:
+        effort = self.effort
+        effort.searches += searches
+        effort.expansions += expansions
+        effort.per_net_expansions[net] = effort.per_net_expansions.get(net, 0) + expansions
+
     def _branch_failed(self, net: int, sink: PinSite, reason: str, expansions: int) -> RoutingFailure:
+        self.effort.branch_failures += 1
         failure = RoutingFailure("unroutable", self.iteration, net, sink, reason, expansions)
         if self.trace:
             self.trace.emit(
@@ -545,6 +635,8 @@ class NegotiatedRedstoneRouter:
         config = self.config
         changed = rerouted
         start = self.iteration
+        best: int | None = None  # fewest conflicts seen in this negotiation
+        since_best = 0
         while True:
             conflicts = self.grid.conflicts()
             hot = sorted({c for conflict in conflicts for c in conflict.cells})
@@ -556,6 +648,19 @@ class NegotiatedRedstoneRouter:
             if self.iteration - start >= config.max_routing_iterations:
                 failure = RoutingFailure("congestion", self.iteration, conflicts=tuple(conflicts))
                 return self._finish(False, failure, conflicts)
+            count = len(conflicts)
+            # Early abort of a nonviable attempt (only ever decides WHEN to give up).
+            factor, margin = config.abort_divergence_factor, config.abort_divergence_margin
+            if best is not None and factor and count > factor * best + margin:
+                detail = f"{count} conflicts after reaching {best}: negotiation is diverging"
+                return self._finish(False, self._abort("diverged", detail, conflicts), conflicts)
+            if best is None or count < best:
+                best, since_best = count, 0
+            else:
+                since_best += 1
+                if config.abort_stagnation_iterations and since_best >= config.abort_stagnation_iterations:
+                    detail = f"no fewer than {best} conflicts for {since_best} iterations"
+                    return self._finish(False, self._abort("stagnated", detail, conflicts), conflicts)
             self.iteration += 1
             self.present_factor *= config.present_factor_growth
             involved = {net for conflict in conflicts for net in conflict.nets}
@@ -574,6 +679,7 @@ class NegotiatedRedstoneRouter:
 
     def _begin_iteration(self, nets: list[int]) -> None:
         self._relax = {}
+        self._iteration_mark = (self.effort.searches, self.effort.expansions, self.rip_ups)
         if self.trace:
             self.trace.emit(
                 "routing",
@@ -584,6 +690,19 @@ class NegotiatedRedstoneRouter:
             )
 
     def _end_iteration(self, rerouted: int, changed: int, conflicts: list[Conflict], hot: list[Coord]) -> None:
+        searches0, expansions0, rip_ups0 = self._iteration_mark
+        record: dict[str, Any] = {
+            "iteration": self.iteration,
+            "present_factor": self.present_factor,
+            "rerouted": rerouted,
+            "changed": changed,
+            "conflicts": len(conflicts),
+            "conflict_cells": len(hot),
+            "searches": self.effort.searches - searches0,
+            "expansions": self.effort.expansions - expansions0,
+            "rip_ups": self.rip_ups - rip_ups0,
+        }
+        self.effort.iterations.append(record)
         trace = self.trace
         if not trace:
             return
@@ -591,12 +710,7 @@ class NegotiatedRedstoneRouter:
         trace.emit(
             "routing",
             "routing_iteration_end",
-            iteration=self.iteration,
-            present_factor=self.present_factor,
-            rerouted=rerouted,
-            changed=changed,
-            conflicts=len(conflicts),
-            conflict_cells=len(hot),
+            **record,
             routed_cells=sum(r.length for r in self.routes.values()),
             history_total=float(sum(grid.history.values())),
         )
@@ -656,14 +770,17 @@ class NegotiatedRedstoneRouter:
             rip_ups=self.rip_ups,
             failure=failure,
             conflicts=list(conflicts or []),
+            effort=self.effort,
         )
 
 
 __all__ = [
+    "ABORT_REASONS",
     "NegotiatedRedstoneRouter",
     "RouteBranch",
     "RouteRequest",
     "RouteTree",
+    "RouterEffort",
     "RoutingFailure",
     "RoutingOutcome",
     "approach_corridor",

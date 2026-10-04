@@ -137,10 +137,11 @@ Every event has a contiguous `seq`, a `phase` (`synthesis`, `techmap`, `pnr`,
 | `net_route_restarted` | routing | basic | `net`, `iteration`, `first_sink`, `restart` — a branch could not be connected (the net walled in its own sink); the net is routed again with that sink first |
 | `net_route_committed` | routing | basic | the net's complete route tree (below) |
 | `net_rip_up` | routing | basic | `net`, `iteration`, `reason` (`congestion` or `legalization`), `cells`, `length` — remove the tree |
-| `routing_iteration_end` | routing | basic | `iteration`, `present_factor`, `rerouted`, `changed`, `conflicts`, `conflict_cells`, `routed_cells`, `history_total` |
+| `routing_iteration_end` | routing | basic | `iteration`, `present_factor`, `rerouted`, `changed`, `conflicts`, `conflict_cells`, `searches`, `expansions`, `rip_ups` (the last three for this iteration), `routed_cells`, `history_total` |
 | `congestion_snapshot` | congestion | basic | `iteration`, `present_factor`, `conflicts: [{kind, cells, nets}]`, `cells: [{coord, history, nets}]`, `history_cells` — replaces the congestion layer |
 | `physical_conflict` | congestion | detailed | `iteration`, `kind`, `cells`, `nets` |
 | `keyframe` | routing | basic, if `keyframe_interval > 0` | `iteration`, `placement: [{instance, origin, orientation, bounds}]`, `routes: [route]`, `realized: [realized route]` (only nets whose tree survived since the last legalization), `congestion` (the cells of this iteration's snapshot) — enough to restart a replay here |
+| `routing_aborted` | routing | basic | `iteration`, `reason` (`diverged`, `stagnated`, `effort_exhausted`), `detail`, `expansions` — the attempt was judged nonviable and is given up early; the P&R driver retries with wider spacing as usual. Followed by `routing_failed` |
 | `routing_complete` / `routing_failed` | routing | basic | `iteration`, `iterations`, `routed_nets`, `rip_ups`, `failure` |
 | `legalization_begin` | legalization | basic | `round`, `nets` |
 | `route_legalization_begin` | legalization | detailed | `net`, `round`, `length`, `drive` |

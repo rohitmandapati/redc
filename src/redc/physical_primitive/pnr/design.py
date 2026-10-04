@@ -44,6 +44,7 @@ from .placement import PlacedPrimitiveDesign, PlacementError, place_design
 from .records import design_records, instance_record
 from .routing import (
     NegotiatedRedstoneRouter,
+    RouterEffort,
     RouteRequest,
     RouteTree,
     RoutingOutcome,
@@ -65,6 +66,7 @@ class RoutedPrimitiveDesign:
     search_bounds: Bounds
     iterations: int
     rip_ups: int
+    effort: RouterEffort | None = None
 
 
 @dataclass
@@ -342,7 +344,9 @@ def _routed(
     outcome: RoutingOutcome,
     bounds: Bounds,
 ) -> RoutedPrimitiveDesign:
-    return RoutedPrimitiveDesign(placed, requests, dict(outcome.routes), bounds, outcome.iterations, outcome.rip_ups)
+    return RoutedPrimitiveDesign(
+        placed, requests, dict(outcome.routes), bounds, outcome.iterations, outcome.rip_ups, outcome.effort
+    )
 
 
 def legalize_all(
@@ -561,6 +565,7 @@ def compute_metrics(result: PrimitivePnRResult) -> dict[str, Any]:
             "repeaters": repeaters,
             "support_blocks": supports,
             "clearance_blocks": len({c for r in realized.values() for c in r.clearances}),
+            "effort": None if result.routed is None or result.routed.effort is None else result.routed.effort.to_dict(),
         },
         "legalization": {
             "rounds": 0 if result.legalized is None else result.legalized.rounds,
